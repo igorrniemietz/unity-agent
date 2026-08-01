@@ -16,12 +16,28 @@ Existe por três motivos medidos:
    acordado nem disputar o canal.
 
 Uso:
-    unity-despachar --nivel claude|gemini --projeto <nome> --dir <caminho> "<tarefa>"
+    unity-despachar --nivel claude|sonnet|gemini|opencode \
+        --projeto <nome> --dir <caminho> "<tarefa>"
     unity-despachar --lista
+
+As quatro faixas, da mais cara para a mais barata:
+
+- `claude`   — Opus 5. Planejar, arquitetura, bug de causa desconhecida.
+- `sonnet`   — Sonnet 5. Mudança com critério sobre alvo conhecido. Mesma
+               assinatura do Opus, peso bem menor na janela de 5 h. Criada em
+               2026-08-01 porque a regra "na dúvida, SOBE" mandava tudo que não
+               era trivial para o Opus, e era isso que esvaziava a janela.
+- `gemini`   — agy (Gemini 3.6 Flash). Grátis pela assinatura. Mudança já
+               especificada e delimitada.
+- `opencode` — DeepSeek v4 Flash pelo harness do opencode, grátis e fora da
+               cota da Anthropic. É a saída de emergência: quando a janela de 5 h
+               estoura, este é o único executor que continua de pé. Mais lento e
+               mais limitado que os outros — mas lento é melhor que parado.
 """
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -32,6 +48,21 @@ from pathlib import Path
 SPOOL = Path.home() / ".local/share/unity-orquestrador"
 LIB = "/home/reaper/.local/bin/unity-lib.py"
 LIMITE_AVISO = 2500  # caracteres do resultado que vão para o chat
+
+# O opencode é instalado em ~/.opencode/bin e ligado por symlink no ~/.local/bin.
+# O `which` cobre o uso normal; o caminho absoluto cobre o systemd, cujo PATH é
+# mínimo e não inclui ~/.local/bin.
+OPENCODE = shutil.which("opencode") or os.path.expanduser("~/.opencode/bin/opencode")
+MODELO_OPENCODE = os.environ.get("UNITY_OPENCODE_MODEL",
+                                 "opencode/deepseek-v4-flash-free")
+
+# Rótulo humano de cada faixa, para o aviso no Telegram.
+EXECUTORES = {
+    "claude": "Claude Opus",
+    "sonnet": "Claude Sonnet",
+    "gemini": "Gemini",
+    "opencode": "DeepSeek (opencode)",
+}
 
 
 def carregar_lib():
@@ -101,9 +132,19 @@ def executar(args, ident):
         # entender onde escrever.
         cmd = ["agy", "-p", args.tarefa + RODAPE, "--add-dir", args.dir,
                "--dangerously-skip-permissions"]
+    elif args.nivel == "opencode":
+        # `--auto` é o equivalente do skip-permissions aqui: sem ele o opencode
+        # para esperando aprovação que ninguém vai dar num despacho headless.
+        # `--dir` já faz ele enxergar o projeto (diferente do agy, que precisa do
+        # caminho repetido no prompt).
+        cmd = [OPENCODE, "run", args.tarefa + RODAPE, "--model", MODELO_OPENCODE,
+               "--dir", args.dir, "--auto"]
     else:
+        # claude = Opus (padrão da conta); sonnet = a faixa do meio.
         cmd = ["claude", "-p", args.tarefa + RODAPE, "--add-dir", args.dir,
                "--permission-mode", "acceptEdits"]
+        if args.nivel == "sonnet":
+            cmd += ["--model", "sonnet"]
 
     try:
         proc = subprocess.run(cmd, cwd=args.dir, capture_output=True, text=True,
@@ -124,7 +165,7 @@ def executar(args, ident):
                "saida": saida[:4000]})
 
     icone = "✅" if ok else "🔴"
-    executor = "Gemini" if args.nivel == "gemini" else "Claude"
+    executor = EXECUTORES.get(args.nivel, args.nivel)
     corpo = saida if len(saida) <= LIMITE_AVISO else saida[:LIMITE_AVISO] + "\n… (cortado)"
     lib.send_telegram(
         f"{icone} {args.projeto} — {executor} terminou em {dur}s\n\n{corpo}",
@@ -134,7 +175,8 @@ def executar(args, ident):
 
 def main():
     p = argparse.ArgumentParser(description="Despacha tarefa para um executor.")
-    p.add_argument("--nivel", choices=["claude", "gemini"], help="executor")
+    p.add_argument("--nivel", choices=["claude", "sonnet", "gemini", "opencode"],
+                   help="executor")
     p.add_argument("--projeto", help="nome do projeto, para o aviso e o spool")
     p.add_argument("--dir", help="caminho absoluto do projeto")
     p.add_argument("--timeout", type=int, default=1800, help="segundos (padrão 1800)")

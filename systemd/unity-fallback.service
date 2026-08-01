@@ -1,0 +1,25 @@
+[Unit]
+# A Unity em modo econômico: atende o Telegram pelo opencode + DeepSeek quando a
+# cota do Claude acaba. Quem liga e desliga esta unit é o `unity-ensure`, que é o
+# árbitro de modo — ela NÃO tem [Install], de propósito: habilitá-la no boot
+# poria dois consumidores de getUpdates no ar (este e a sessão Claude da Unity),
+# e o Telegram só aceita um por token. Mensagem sumiria alternadamente.
+Description=Unity em modo economico (opencode + DeepSeek)
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/reaper/.local/bin/unity-fallback
+WorkingDirectory=/home/reaper
+
+# O PATH do systemd é mínimo e não traz ~/.local/bin. Sem isto o agente não acha
+# `unity-despachar` nem `unity-uso` — perderia justamente a capacidade de
+# despachar pro Gemini, que é o motivo deste modo existir.
+Environment=PATH=/home/reaper/.local/bin:/home/reaper/.opencode/bin:/home/reaper/.nvm/versions/node/v24.18.0/bin:/usr/bin:/bin
+
+# Sem isto o hook Stop manda uma segunda cópia de cada resposta — a duplicata
+# que já custou depuração em 2026-08-01.
+Environment=UNITY_NO_TELEGRAM_HOOK=1
+
+Restart=always
+RestartSec=10

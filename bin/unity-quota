@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+"""Quanto da cota do Claude já foi usada. Fonte única para quem precisa decidir.
+
+Existe porque duas peças precisam do mesmo número e não podem discordar: o
+`unity-ensure`, que decide qual modo da Unity deve estar no ar, e o `unity-uso`,
+que conta para o Igor. Número divergente aqui viraria troca de modo em looping.
+
+Imprime `<pct_5h> <pct_7d>` em stdout. Sai com 1 se a fonte não responder —
+e quem chama DEVE tratar isso como "não sei", nunca como 0. Assumir 0 num erro
+transitório derrubaria a Unity do modo Claude para o fallback sem motivo.
+
+    $ unity-quota
+    21 33
+"""
+import json
+import re
+import subprocess
+import sys
+
+USAGEBAR = "/home/reaper/.local/bin/ai-usagebar"
+
+
+def ler():
+    p = subprocess.run(
+        [USAGEBAR, "--vendor", "anthropic", "--json",
+         "--format", "{session_pct}|{weekly_pct}"],
+        capture_output=True, text=True, timeout=25)
+    texto = re.sub("<[^>]+>", "", json.loads(p.stdout)["text"])
+    partes = [re.sub(r"[^0-9]", "", x) for x in texto.split("|")]
+    if len(partes) != 2 or not all(partes):
+        raise ValueError(f"formato inesperado: {texto!r}")
+    return int(partes[0]), int(partes[1])
+
+
+def main():
+    try:
+        cinco, semana = ler()
+    except Exception as exc:
+        print(f"unity-quota: fonte indisponível: {exc}", file=sys.stderr)
+        return 1
+    print(f"{cinco} {semana}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

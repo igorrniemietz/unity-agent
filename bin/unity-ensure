@@ -61,8 +61,98 @@ try:
 except Exception: pass' 2>/dev/null
 }
 
+# ---------------------------------------------------------------------------
+# Árbitro de modo: quem é a Unity agora, o Claude ou o DeepSeek?
+#
+# Quando a janela de 5 h da assinatura acaba, a sessão Claude para de responder
+# e o canal fica MUDO — sem erro, sem aviso. O modo econômico troca o cérebro
+# por DeepSeek v4 Flash dentro do opencode (grátis, fora da cota da Anthropic)
+# para o Igor continuar sendo atendido e continuar conseguindo despachar pro
+# Gemini, que também é grátis.
+#
+# ESTE SCRIPT É O ÚNICO ÁRBITRO. O Telegram aceita um consumidor de getUpdates
+# por token; os dois modos no ar ao mesmo tempo fazem mensagem sumir
+# alternadamente. Então aqui sempre se DERRUBA um antes de subir o outro.
+#
+# Histerese de propósito: entra em 92% e só volta em 85%. Com um limiar só, o
+# uso oscilando em torno dele trocaria de modo a cada 2 minutos, e cada volta ao
+# Claude custa ~19 mil tokens de sessão nova — o próprio remédio consumiria a
+# cota que ele existe para preservar.
+ENTRA_ECONOMICO="${UNITY_LIMIAR_ENTRA:-92}"
+VOLTA_NORMAL="${UNITY_LIMIAR_VOLTA:-85}"
+MODO_ARQ="$HOME/.local/share/unity-supervisor/modo"
+MODO_ATUAL="$(cat "$MODO_ARQ" 2>/dev/null || echo claude)"
+
+PCT="$(unity-quota 2>/dev/null | awk '{print $1}')"
+if [ -z "$PCT" ]; then
+  # Fonte de cota muda. NUNCA tratar como 0% nem como 100%: um erro transitório
+  # do ai-usagebar não é motivo para trocar o cérebro da Unity. Mantém o modo.
+  log "AVISO: unity-quota não respondeu — mantendo modo '$MODO_ATUAL'"
+  MODO_ALVO="$MODO_ATUAL"
+elif [ "$PCT" -ge "$ENTRA_ECONOMICO" ]; then
+  MODO_ALVO="economico"
+elif [ "$PCT" -le "$VOLTA_NORMAL" ]; then
+  MODO_ALVO="claude"
+else
+  MODO_ALVO="$MODO_ATUAL"   # zona morta da histerese
+fi
+
+derrubar_canal_claude() {
+  for id in $(agentes_de_fundo); do
+    timeout 25 claude stop "$id" >/dev/null 2>&1 \
+      && log "sessão Claude $id encerrada (troca de modo)"
+  done
+  for pid in $(ps -eo pid,args | grep -E '[s]erver[.]ts' | awk '{print $1}'); do
+    kill "$pid" 2>/dev/null
+  done
+  sleep 2
+}
+
+fallback_ativo() { systemctl --user is-active --quiet unity-fallback.service; }
+
+if [ "$MODO_ALVO" = "economico" ]; then
+  if [ "$MODO_ATUAL" != "economico" ] || ! fallback_ativo; then
+    log "cota em ${PCT}% (>= ${ENTRA_ECONOMICO}%) — passando o canal para o DeepSeek"
+    derrubar_canal_claude
+    systemctl --user start unity-fallback.service \
+      && log "modo econômico no ar" || log "FALHA ao subir o modo econômico"
+    printf 'economico' > "$MODO_ARQ"
+  fi
+  # Sai aqui de propósito: a lógica abaixo RECRIA a sessão Claude, e recriá-la
+  # agora poria os dois modos disputando o mesmo getUpdates.
+  exit 0
+fi
+
+VOLTANDO=0
+if [ "$MODO_ATUAL" = "economico" ]; then
+  log "cota em ${PCT}% (<= ${VOLTA_NORMAL}%) — devolvendo o canal para o Claude"
+  systemctl --user stop unity-fallback.service 2>/dev/null
+  sleep 2   # deixa o getUpdates em curso terminar antes de outro assumir
+  VOLTANDO=1
+  # A entrada no modo econômico se anuncia sozinha (o próprio fallback avisa).
+  # A volta precisa ser anunciada aqui, porque quem volta é uma sessão nova que
+  # não sabe que houve troca. Sem este aviso o Igor não tem como saber com quem
+  # está falando — e a diferença importa: uma despacha pro Claude, a outra não.
+  python3 -c "
+import importlib.util as u
+s=u.spec_from_file_location('l','/home/reaper/.local/bin/unity-lib.py')
+m=u.module_from_spec(s); s.loader.exec_module(m)
+m.send_telegram('✅ Voltei ao normal — cota do Claude em ${PCT}%. Despacho pro Claude e pro Sonnet liberado de novo.', silent=False)" \
+    >/dev/null 2>&1
+fi
+printf 'claude' > "$MODO_ARQ"
+# ---------------------------------------------------------------------------
+
 # Estado entre execuções, para o amortecedor (ver adiante).
 FALHA="$HOME/.local/share/unity-supervisor/falha-anterior"
+
+# O amortecedor existe para não recriar a sessão num piscar de olho. Mas na
+# volta do modo econômico a ausência não é dúvida: fomos NÓS que derrubamos a
+# sessão Claude ao entrar. Esperar a segunda detecção deixaria o canal mudo por
+# mais 2 minutos sem nenhum ganho, então a confirmação já entra dada.
+if [ "$VOLTANDO" = "1" ]; then
+  printf 'volta-do-modo-economico' > "$FALHA"
+fi
 
 if [ "$(servidores_com_tty)" -gt 0 ]; then
   log "AVISO: servidor do plugin com TTY — sessão interativa disputando getUpdates"

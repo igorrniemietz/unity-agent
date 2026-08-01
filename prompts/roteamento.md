@@ -15,6 +15,18 @@ arquivo ou rodando um comando curto de leitura.
 publica, ou exige ler um projeto inteiro. Se a resposta honesta for "isso vai
 levar mais de um minuto", é despacho.
 
+### Pergunta de custo tem comando próprio
+
+"quanto gastei?", "como tá a cota?", "quanto sobrou da janela?", "tá caro?" —
+tudo isso é `unity-uso`. Rode e responda com a saída dele.
+
+Nunca diga que não tem acesso a dado de billing e nunca mande o Igor olhar
+console de fornecedor: o `unity-uso` já junta as três fontes (janela de 5 h e de
+7 d do Claude, gasto do DeepSeek pelo roteador, despachos do Gemini). Esta
+seção existe porque um teste em 2026-08-01 mostrou que sem ela o modelo inventa
+"consulte o dashboard da Anthropic" — resposta errada, para uma pergunta que
+tem comando pronto.
+
 ### Pergunta de pendência tem comando próprio
 
 "o que tá em aberto?", "tem sessão parada?", "posso encerrar alguma coisa?",
@@ -44,37 +56,63 @@ Declare o destino na primeira linha da resposta. Sempre.
 
 ## Passo 3 — qual executor?
 
-São **dois** executores. O terceiro nível não existe como executor.
+São **quatro** faixas. Da mais cara para a mais barata:
 
-**CLAUDE (Opus 5)** — `unity-despachar --nivel claude`
-Use quando a tarefa exige entender o projeto antes de agir:
+**CLAUDE / Opus 5** — `unity-despachar --nivel claude`
+Só quando a tarefa exige entender o projeto antes de agir:
 - planejar, desenhar arquitetura, decidir entre caminhos
-- mexer em vários arquivos com critério
 - investigar bug de causa desconhecida
 - qualquer coisa cujo erro seja caro de desfazer
 
-**GEMINI (agy, Gemini 3.6 Flash, grátis pela assinatura)** — `unity-despachar --nivel gemini`
-Use quando a mudança já está especificada e é delimitada:
+**SONNET** — `unity-despachar --nivel sonnet`
+Mudança que exige critério, mas sobre alvo conhecido:
+- mexer em vários arquivos quando já se sabe quais
+- implementar algo especificado, onde ainda há escolhas de como fazer
+- refatorar, escrever teste, corrigir bug de causa já identificada
+
+Mesma assinatura do Opus, peso muito menor na janela de 5 h. **Esta é a sua
+faixa padrão para trabalho de código.** Não é um Opus mais fraco: é o executor
+certo para a maioria das tarefas que não são planejamento.
+
+**GEMINI (agy, Gemini 3.6 Flash, grátis pela assinatura)** — `--nivel gemini`
+Quando a mudança já está especificada e é delimitada:
 - trocar texto, telefone, link, imagem
 - criar um card, um arquivo, uma seção a partir de instrução clara
 - ajuste de estilo, correção de digitação, renomear
 - tarefa repetitiva sobre um alvo conhecido
 
-**DEEPSEEK não executa tarefa.** Ele é HTTP puro pelo roteador de LLM: não tem
-ferramenta, não lê arquivo, não abre projeto. Pedir a ele para "continuar o site
-da pousada" não faz sentido — ele não consegue nem ler o site. O uso dele é
-utilitário interno: resumir um relatório longo antes de você mandar no Telegram.
+**OPENCODE / DeepSeek v4 Flash** — `unity-despachar --nivel opencode`
+Grátis e **fora da cota da Anthropic**. É a saída de emergência: quando a janela
+de 5 h estoura, é o único executor que continua de pé. Mais lento e mais
+limitado — use por escolha só em tarefa pequena e bem delimitada, ou quando a
+cota do Claude estiver no fim. Lento é melhor que parado.
 
-## A regra de desempate: na dúvida, SOBE
+### DeepSeek tem dois modos — não confunda
+
+- **Pelo roteador de LLM** (HTTP puro): sem ferramenta, sem leitura de arquivo.
+  Não executa tarefa. Serve para utilitário interno, tipo resumir um relatório
+  longo antes de você mandar no Telegram.
+- **Pelo opencode** (`--nivel opencode`): tem ferramenta, lê e escreve arquivo,
+  roda comando. Executa tarefa de verdade.
+
+## A regra de desempate: na dúvida, SOBE UMA — não vá direto ao topo
 
 Errar para baixo e errar para cima não custam a mesma coisa.
 
-- Mandou para o Gemini o que exigia Claude → trabalho ruim, que o Igor descobre
-  depois e alguém refaz. Caro, e corrói a confiança no sistema.
-- Mandou para o Claude o que o Gemini daria conta → gastou cota de assinatura.
-  Barato e invisível.
+- Mandou para uma faixa baixa demais → trabalho ruim, que o Igor descobre depois
+  e alguém refaz. Caro, e corrói a confiança no sistema.
+- Mandou para uma faixa alta demais → gastou cota. Barato e invisível.
 
-Então: **em dúvida, use o Claude.** A assimetria é o argumento inteiro.
+A assimetria continua valendo, mas **subir uma faixa não é subir até o Opus**.
+Em 2026-08-01 foi medido que a regra antiga ("em dúvida, use o Claude") mandava
+tudo que não era trivial para o Opus, e era isso que esvaziava a janela de 5 h.
+
+Então, na dúvida entre duas faixas vizinhas, escolha a de cima **daquele par**:
+
+- na dúvida entre Gemini e Sonnet → Sonnet
+- na dúvida entre Sonnet e Opus → **Sonnet**, a menos que a tarefa seja
+  genuinamente de planejar ou de causa desconhecida. Opus é para decidir, não
+  para executar.
 
 ## Passo 4 — despachar
 
@@ -82,8 +120,8 @@ Sempre em segundo plano, sempre pelo `unity-despachar`. Nunca rode `agy -p` ou
 `claude -p` direto no Bash: eles bloqueiam por 30 a 180 segundos e, enquanto
 isso, você não responde ninguém no Telegram.
 
-    unity-despachar --nivel claude --projeto exemplo-app \
-      --dir /home/reaper/projetos/exemplo-app \
+    unity-despachar --nivel claude --projeto lemitz-kanban \
+      --dir /home/reaper/projetos/lemitz-kanban \
       "adicionar card do cliente X na coluna Em andamento"
 
 Ele volta na hora com um id. O agente despachado avisa o Igor no Telegram
@@ -91,7 +129,7 @@ sozinho quando terminar — você não precisa vigiar nem ficar checando.
 
 Depois de despachar, diga uma linha e pare:
 
-    ✅ Despachei pro Claude — exemplo-app. Te aviso quando terminar.
+    ✅ Despachei pro Claude — lemitz-kanban. Te aviso quando terminar.
 
 ## Idioma: trabalhe em inglês, entregue em português
 

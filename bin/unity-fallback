@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+"""A Unity em modo econômico: atende o Telegram pelo opencode + DeepSeek.
+
+Por que existe: a Unity normal é uma sessão do Claude Code. Quando a janela de
+5 h da assinatura estoura, essa sessão não responde mais e o canal fica MUDO —
+sem erro, sem aviso, o Igor manda mensagem e não volta nada. Este processo é a
+saída de emergência: fala com o mesmo bot, pelo mesmo token, mas o cérebro é o
+DeepSeek v4 Flash rodando dentro do opencode, que é grátis e não consome cota
+da Anthropic.
+
+Ele NÃO substitui a Unity. Ele é pior e sabe disso: avisa no primeiro contato
+que está em modo econômico. O que ele preserva é a capacidade de despachar —
+`unity-despachar --nivel gemini` continua funcionando, e o Gemini também é
+grátis. Ou seja: mesmo com a cota do Claude zerada, o Igor ainda consegue mandar
+trabalho para um executor de verdade.
+
+## A trava do Telegram
+
+O Telegram aceita **um único consumidor de getUpdates por token**. Duas peças
+lendo o mesmo bot brigam e as mensagens somem alternadamente — sintoma que já
+custou depuração aqui. Então este processo e a sessão Claude da Unity NUNCA
+podem estar no ar ao mesmo tempo. Quem garante isso é o `unity-ensure`, que é o
+árbitro: ele para um antes de subir o outro. Este script não decide nada sobre
+modo; ele só atende enquanto estiver vivo.
+
+## Offset
+
+Na primeira volta ele DESCARTA o que estiver represado (`getUpdates` com
+offset=-1) e só então começa a responder. Sem isso, ao assumir o canal ele
+responderia de novo tudo que a Unity já tinha respondido antes de cair.
+"""
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, "/home/reaper/.local/bin")
+import importlib.util as _u
+_spec = _u.spec_from_file_location("unity_lib", "/home/reaper/.local/bin/unity-lib.py")
+lib = _u.module_from_spec(_spec)
+_spec.loader.exec_module(lib)
+
+ESTADO = Path.home() / ".local/share/unity-supervisor"
+OFFSET = ESTADO / "fallback-offset.json"
+SESSAO = ESTADO / "fallback-sessao.json"
+
+# Diretório próprio, e não o $HOME como a Unity normal: o opencode lê o
+# AGENTS.md do diretório de trabalho, e escrever um AGENTS.md na raiz da home
+# afetaria toda sessão de opencode que o Igor abrisse ali. O agente continua
+# alcançando qualquer projeto por caminho absoluto e pelo `unity-despachar`.
+TRABALHO = Path.home() / ".local/share/unity-fallback"
+AGENTS = TRABALHO / "AGENTS.md"
+PROMPTS = Path.home() / ".claude/orquestrador"
+
+OPENCODE = "/home/reaper/.opencode/bin/opencode"
+MODELO = os.environ.get("UNITY_OPENCODE_MODEL", "opencode/deepseek-v4-flash-free")
+TIMEOUT_RESPOSTA = int(os.environ.get("UNITY_FALLBACK_TIMEOUT", "300"))
+
+# Sessão do opencode expira sozinha: contexto do DeepSeek é curto e uma sessão
+# de dias vira prompt gigante e caro em latência. Duas horas cobrem uma conversa
+# real sem deixar o histórico crescer sem limite.
+VALIDADE_SESSAO = 2 * 3600
+
+
+def api(metodo, params=None, timeout=70):
+    token = lib.read_env(lib.TELEGRAM_ENV, "TELEGRAM_BOT_TOKEN")
+    if not token:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN ausente")
+    url = f"https://api.telegram.org/bot{token}/{metodo}"
+    dados = urllib.parse.urlencode(params or {}).encode()
+    req = urllib.request.Request(url, data=dados, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode())
+
+
+def chat_autorizado():
+    return (lib.read_env(lib.TELEGRAM_ENV, "TELEGRAM_CHAT_ID") or "").strip()
+
+
+def escrever_agents():
+    """Monta o AGENTS.md que o opencode lê como instrução permanente.
+
+    Reaproveita a persona e o roteamento reais da Unity, para o modo econômico
+    não ter personalidade nem regras próprias — divergir aqui significaria o
+    Igor conversando com duas Unitys diferentes conforme a cota do dia.
+    """
+    partes = ["# Você é a Unity, em modo econômico\n"]
+    for nome in ("persona.md", "roteamento.md", "projetos.md"):
+        caminho = PROMPTS / nome
+        if caminho.exists():
+            partes.append(caminho.read_text())
+    partes.append("""
+# O que muda no modo econômico
+
+Você está rodando no DeepSeek v4 Flash porque a cota do Claude acabou. Isso é
+temporário e volta sozinho quando a janela zera.
+
+Regras que MUDAM enquanto você está assim:
+
+- **Não despache para `claude` nem para `sonnet`.** Não há cota. Tentar é
+  garantir um despacho que volta com erro.
+- Para trabalho de código, despache para `gemini`, que é grátis:
+  `unity-despachar --nivel gemini --projeto <slug> --dir <caminho> "<tarefa em inglês>"`
+- Se a tarefa exigir mesmo Opus (planejar, arquitetura, causa desconhecida),
+  NÃO improvise: diga ao Igor que isso precisa esperar a cota voltar, e diga
+  quanto falta (`unity-uso`).
+- Seja mais curta que o normal. Você é mais lenta agora; texto longo piora.
+
+Diga que está em modo econômico **uma vez**, no primeiro contato. Depois pare
+de repetir — o Igor já sabe.
+""")
+    AGENTS.write_text("\n\n".join(partes))
+
+
+def continuar_conversa():
+    """True se a conversa em curso ainda vale, False se é hora de começar limpa.
+
+    O `opencode run` não devolve o id da sessão que criou, então não dá para
+    guardar id e retomar por id. O que funciona é `--continue`, que retoma a
+    última sessão DAQUELE diretório — por isso o diretório de trabalho é
+    exclusivo deste processo.
+
+    O prazo existe porque `--continue` cresce sem limite: o contexto do DeepSeek
+    é curto, e uma sessão de dias vira prompt gigante, lento e truncado. Duas
+    horas cobrem uma conversa real e depois a memória recomeça.
+    """
+    try:
+        if time.time() - json.loads(SESSAO.read_text())["desde"] < VALIDADE_SESSAO:
+            return True
+    except Exception:
+        pass
+    SESSAO.write_text(json.dumps({"desde": time.time()}))
+    return False
+
+
+def responder(texto):
+    """Roda o opencode e devolve a resposta dele, já limpa de segredo."""
+    cmd = [OPENCODE, "run", texto, "--model", MODELO,
+           "--dir", str(TRABALHO), "--auto"]
+    if continuar_conversa():
+        cmd.append("--continue")
+
+    # PATH explícito: o systemd entrega um PATH mínimo, e sem ~/.local/bin o
+    # agente não acha `unity-despachar` nem `unity-uso` — perderia justamente a
+    # capacidade que justifica este modo existir.
+    env = dict(os.environ)
+    env["PATH"] = f"{Path.home()}/.local/bin:{Path.home()}/.opencode/bin:" + env.get("PATH", "")
+    env["UNITY_NO_TELEGRAM_HOOK"] = "1"
+
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=TIMEOUT_RESPOSTA, cwd=str(TRABALHO), env=env)
+    except subprocess.TimeoutExpired:
+        return f"⏳ Demorei demais ({TIMEOUT_RESPOSTA}s) e cortei. Tenta pedir menor?"
+
+    saida = (p.stdout or "").strip()
+    if not saida:
+        return "🔴 Não consegui responder (o opencode voltou vazio)."
+
+    # O `opencode run` imprime as chamadas de ferramenta antes da resposta.
+    # Interessa a última fala, não o passo a passo.
+    linhas = [l for l in saida.splitlines() if l.strip()]
+    corte = 0
+    for i, l in enumerate(linhas):
+        if l.lstrip().startswith(("$", "→", "←", ">")):
+            corte = i + 1
+    resposta = "\n".join(linhas[corte:]).strip() or saida
+    return lib.truncate(lib.clean(resposta))
+
+
+def sincronizar_offset():
+    """Descarta o represado e devolve o offset a partir do qual atender."""
+    try:
+        r = api("getUpdates", {"offset": -1, "timeout": 0}, timeout=20)
+        resultado = r.get("result") or []
+        if resultado:
+            return resultado[-1]["update_id"] + 1
+    except Exception as exc:
+        print(f"não consegui sincronizar offset: {exc}", file=sys.stderr)
+    return None
+
+
+def main():
+    ESTADO.mkdir(parents=True, exist_ok=True)
+    TRABALHO.mkdir(parents=True, exist_ok=True)
+    escrever_agents()
+
+    offset = sincronizar_offset()
+    autorizado = chat_autorizado()
+
+    lib.send_telegram(
+        "⚡ Unity em modo econômico — a cota do Claude acabou, estou rodando no "
+        "DeepSeek. Mais lenta, e sem despachar pro Claude. Gemini continua "
+        "funcionando normal. Volto ao normal sozinha quando a janela zerar.",
+        silent=False)
+
+    while True:
+        try:
+            r = api("getUpdates", {"offset": offset or 0, "timeout": 50})
+        except Exception as exc:
+            print(f"getUpdates falhou: {exc}", file=sys.stderr)
+            time.sleep(5)
+            continue
+
+        for up in r.get("result") or []:
+            offset = up["update_id"] + 1
+            OFFSET.write_text(json.dumps({"offset": offset}))
+            msg = up.get("message") or {}
+            texto = (msg.get("text") or "").strip()
+            chat = str((msg.get("chat") or {}).get("id") or "")
+            if not texto:
+                continue
+            # Só o dono. Sem isso, qualquer um que ache o bot conversa com um
+            # agente que tem shell na máquina.
+            if autorizado and chat != autorizado:
+                print(f"ignorando chat não autorizado: {chat}", file=sys.stderr)
+                continue
+            try:
+                lib.send_telegram(responder(texto), silent=False)
+            except Exception as exc:
+                print(f"falha ao responder: {exc}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
