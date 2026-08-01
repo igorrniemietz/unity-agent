@@ -25,6 +25,7 @@ custa um item na lixeira; travar custa o agente inteiro.
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 
@@ -49,16 +50,95 @@ APAGA = [
 # alternativa que ele recomenda — o agente ficaria sem caminho nenhum.
 ISENTO = re.compile(r"\bunity-trash\b")
 
+# O que é segredo DE VERDADE. Até 2026-08-01 havia aqui um `/home/reaper/infra/`
+# cru, que barrava a pasta inteira — inclusive os logs do llm-router, que são
+# justamente a fonte de custo medido dos relatórios. O dono estreitou para .env
+# e material de chave, alinhando o hook ao que o settings.json dele já dizia
+# (`Read(/home/reaper/infra/**/.env)`), em vez da pasta toda.
 SEGREDO = [
     (r"(?:^|[\s'\"=])~?/?(?:home/reaper/)?\.ssh/", "~/.ssh"),
-    (r"\.env\b",                                    "arquivo .env"),
-    (r"/home/reaper/infra/",                        "~/infra"),
+    (r"\.env\b",                                   "arquivo .env"),
+    (r"\.(?:key|pem|p12|pfx|keystore|jks)\b",      "arquivo de chave"),
+    (r"\b(?:credentials|secrets?)\.(?:json|ya?ml|txt|ini)\b", "arquivo de credencial"),
+    (r"\bid_(?:rsa|ed25519|ecdsa|dsa)\b",          "chave privada ssh"),
 ]
-# Ler o PRÓPRIO diretório de segredo é proibido; mas o agente precisa poder
-# citar caminhos em texto. Só barra quando o comando de fato lê/copia/move.
+
+# Comandos que de fato LEEM/COPIAM um caminho recebido como argumento.
 LEITURA = re.compile(
-    r"\b(?:cat|less|more|head|tail|bat|cp|mv|scp|rsync|tar|zip|base64|xxd|od|"
-    r"strings|grep|rg|awk|sed|python3?|node|curl|wget)\b")
+    r"^(?:cat|less|more|head|tail|bat|cp|mv|scp|rsync|tar|zip|base64|xxd|od|"
+    r"strings|grep|rg|awk|sed|curl|wget|source|\.|export|printenv|dd|install)$")
+
+# Comandos que recebem CÓDIGO numa string: ali o caminho vai embutido no
+# argumento e não como token próprio, então o token-com-espaço é legítimo.
+CODIGO = re.compile(r"^(?:python3?|node|bash|sh|zsh|perl|ruby|eval|deno|bun)$")
+
+# Palavras que só prefixam outro comando; o comando real vem depois delas.
+PREFIXO = re.compile(r"^(?:sudo|env|xargs|nohup|time|command|builtin|exec|then|do|else)$")
+
+
+def _segmentos(cmd):
+    """Quebra em comandos independentes, para avaliar cada um no seu contexto."""
+    return [s for s in re.split(r"[\n;&|]+", cmd) if s.strip()]
+
+
+def usa_segredo(cmd):
+    """(nome_do_segredo) se o comando REALMENTE alcança um segredo, senão None.
+
+    O discriminador é o token, não a string inteira. Um caminho de verdade vem
+    como argumento próprio — sem espaço. Um caminho CITADO dentro de um prompt
+    vem dentro de um token grande, cheio de espaços, que é dado para outro
+    programa (`unity-despachar "...«/home/reaper/infra/x/.env»..."`), não lido
+    por este comando.
+
+    Foi essa a confusão que travou a Unity em 2026-08-01: o teste antigo era
+    `regex_do_segredo AND verbo_de_leitura` procurados em QUALQUER lugar da
+    linha, então um despacho que mencionava um caminho e a palavra "tail" no
+    meio da prosa era barrado como se estivesse lendo o arquivo.
+    """
+    for seg in _segmentos(cmd):
+        try:
+            tokens = shlex.split(seg, comments=False)
+        except ValueError:
+            # Aspas desbalanceadas: sem como tokenizar com confiança. Cai no
+            # critério antigo (linha inteira), que erra para o lado de barrar.
+            for rx, nome in SEGREDO:
+                if re.search(rx, seg) and re.search(LEITURA.pattern[1:-1], seg):
+                    return nome
+            continue
+        if not tokens:
+            continue
+
+        # O comando real é o primeiro token que não é prefixo, opção nem
+        # atribuição de variável (VAR=valor antes do comando).
+        verbo = ""
+        for t in tokens:
+            if t.startswith("-") or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", t):
+                continue
+            base = os.path.basename(t)
+            if PREFIXO.match(base):
+                continue
+            verbo = base
+            break
+
+        for t in tokens:
+            tem_espaco = bool(re.search(r"\s", t))
+            for rx, nome in SEGREDO:
+                if not re.search(rx, t):
+                    continue
+                # (a) caminho como argumento próprio: é uso real, sempre barra.
+                if not tem_espaco:
+                    return nome
+                # (b) string de código dada a python/node/bash: também é uso.
+                if CODIGO.match(verbo):
+                    return nome
+                # (c) prosa: só barra se mandar LER o segredo ali mesmo, isto é,
+                #     um verbo de leitura colado ao caminho (até ~30 chars).
+                m = re.search(rx, t)
+                antes = t[max(0, m.start() - 30):m.start()]
+                if re.search(r"\b(?:cat|less|head|tail|grep|cp|mv|scp|base64|"
+                             r"strings|source|abrir|leia|ler)\b", antes, re.I):
+                    return nome
+    return None
 
 
 def avisa(texto):
@@ -111,15 +191,16 @@ def main():
     if not cmd:
         return
 
-    for rx, nome in SEGREDO:
-        if re.search(rx, cmd) and LEITURA.search(cmd):
-            nega(
-                f"Barrado: o comando alcança segredo ({nome}). O orquestrador "
-                f"não precisa de chave nem de token para nenhuma tarefa. Não "
-                f"há alternativa aqui — siga sem esse passo e relate.",
-                f"🔒 BARRADO (segredo: {nome})\n\n{cmd[:600]}",
-            )
-            return
+    nome = usa_segredo(cmd)
+    if nome:
+        nega(
+            f"Barrado: o comando alcança segredo ({nome}). O orquestrador "
+            f"não precisa de chave nem de token para nenhuma tarefa. Não "
+            f"há alternativa aqui — siga sem esse passo e relate. Citar o "
+            f"caminho em texto é permitido; ler o arquivo, não.",
+            f"🔒 BARRADO (segredo: {nome})\n\n{cmd[:600]}",
+        )
+        return
 
     if ISENTO.search(cmd):
         return
