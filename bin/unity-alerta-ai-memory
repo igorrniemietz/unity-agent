@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+"""Alerta dedicado ao gasto do ai-memory. Roda por timer, várias vezes ao dia.
+
+Por que separado do `unity-costs-telegram`: o resumo diário chega às 21:40, e o
+ai-memory é o único componente que pode disparar sozinho, sem ninguém pedir —
+o agendador dele revisa sessão nova em **14 escopos**, e cada revisão custa
+~US$ 0,007. Um dia com muita sessão pode multiplicar isso enquanto o dono está
+longe do PC. Descobrir às 21:40 é descobrir tarde.
+
+Um alerta por patamar por dia, e não um por verificação: passar de US$ 0,10 tem
+de avisar UMA vez, não a cada 30 minutos até a meia-noite. O estado fica em
+disco porque o timer roda processo novo toda vez e memória não sobrevive.
+
+    unity-alerta-ai-memory              verifica e alerta se cruzou patamar
+    unity-alerta-ai-memory --dry-run    mostra o estado, não manda nem grava
+    unity-alerta-ai-memory --forcar     manda o estado atual, ignorando patamar
+"""
+import json
+import sys
+from datetime import date
+from pathlib import Path
+
+LEDGER = Path.home() / ".local/share/llm-router"
+ESTADO = Path.home() / ".local/share/unity-supervisor/alerta-ai-memory.json"
+PROVIDERS = Path.home() / "infra/llm-router/providers.json"
+
+# Patamares em USD. O primeiro é baixo de propósito: o gasto normal do
+# ai-memory é ~US$ 0,03/dia, então cruzar US$ 0,10 já significa três vezes o
+# normal — cedo o bastante para agir, alto o bastante para não tocar à toa.
+PATAMARES = [0.10, 0.25, 0.40]
+
+
+def carregar_lib():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "unity_lib", "/home/reaper/.local/bin/unity-lib.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def gasto_ai_memory():
+    """(usd, chamadas, tokens_entrada, tokens_saida) do ai-memory hoje."""
+    caminho = LEDGER / f"{date.today().isoformat()}.jsonl"
+    usd, n, tin, tout = 0.0, 0, 0, 0
+    if not caminho.exists():
+        return usd, n, tin, tout
+    for linha in caminho.read_text().splitlines():
+        try:
+            r = json.loads(linha)
+        except Exception:
+            continue
+        if r.get("client") != "ai-memory" or r.get("error"):
+            continue
+        usd += r.get("cost_usd") or 0.0
+        tin += r.get("prompt_tokens") or 0
+        tout += r.get("completion_tokens") or 0
+        n += 1
+    return usd, n, tin, tout
+
+
+def teto():
+    try:
+        cfg = json.loads(PROVIDERS.read_text())
+        return cfg["providers"]["deepseek"].get("daily_cap_usd") or 0.5
+    except Exception:
+        return 0.5
+
+
+def ler_estado():
+    """Patamares já avisados hoje. Dia diferente zera — sem varrer histórico."""
+    try:
+        d = json.loads(ESTADO.read_text())
+        if d.get("dia") == date.today().isoformat():
+            return set(d.get("avisados", []))
+    except Exception:
+        pass
+    return set()
+
+
+def gravar_estado(avisados):
+    ESTADO.parent.mkdir(parents=True, exist_ok=True)
+    ESTADO.write_text(json.dumps({
+        "dia": date.today().isoformat(),
+        "avisados": sorted(avisados),
+    }))
+
+
+def brl(v):
+    return f"{v:.4f}".replace(".", ",")
+
+
+def main():
+    seco = "--dry-run" in sys.argv
+    forcar = "--forcar" in sys.argv
+
+    usd, n, tin, tout = gasto_ai_memory()
+    avisados = ler_estado()
+    cruzados = [p for p in PATAMARES if usd >= p]
+    novos = [p for p in cruzados if str(p) not in avisados]
+
+    if seco:
+        print(f"ai-memory hoje: US$ {brl(usd)} em {n} chamada(s) "
+              f"({tin} entrada / {tout} saída)")
+        print(f"patamares cruzados: {cruzados or 'nenhum'}")
+        print(f"já avisados hoje:   {sorted(avisados) or 'nenhum'}")
+        print(f"alertaria agora:    {novos or 'não'}")
+        return 0
+
+    if not novos and not forcar:
+        return 0
+
+    patamar = max(novos) if novos else 0
+    icone = "🔴" if patamar >= 0.40 else ("⚠️" if patamar >= 0.25 else "💰")
+    normal = 0.03  # gasto típico medido em 2026-07-31
+    vezes = usd / normal if normal else 0
+
+    # Cada número é formatado sozinho. Aplicar .replace('.', ',') na frase
+    # inteira trocava também o ponto final da sentença — saía "(US$ 0,0300),".
+    teto_fmt = f"{teto():.2f}".replace(".", ",")
+    texto = (
+        f"{icone} ai-memory gastou US$ {brl(usd)} hoje\n\n"
+        f"{n} chamada(s) · {tin + tout} tokens\n"
+        f"É cerca de {vezes:.0f}x o normal de um dia (US$ {brl(normal)}).\n"
+        f"Teto diário da DeepSeek: US$ {teto_fmt}"
+    )
+    if patamar >= 0.25:
+        texto += ("\n\nSe não foi você que pediu, provavelmente é o agendador "
+                  "revisando muitas sessões. Dá pra desligar em "
+                  "[auto_improve.scheduler] enabled = false.")
+
+    lib = carregar_lib()
+    ok = lib.send_telegram(texto, silent=False)
+    if ok and novos:
+        gravar_estado(avisados | {str(p) for p in novos})
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as exc:
+        print(f"unity-alerta-ai-memory falhou: {exc}", file=sys.stderr)
+        sys.exit(1)

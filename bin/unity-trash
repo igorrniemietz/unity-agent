@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""Lixeira do agente: move em vez de apagar.
+
+Existe porque o orquestrador roda sem pedir aprovação. Sem prompt, "apagar" e
+"apagar errado" ficam indistinguíveis até alguém notar a falta — e o `cwd` do
+supervisor é /home/reaper, não ~/projetos, então o alcance inclui ~/.ssh,
+~/infra e projetos de cliente.
+
+O par disto é o hook `unity-block-delete`, que BARRA rm/rmdir/shred/git clean e
+manda o agente usar este comando. Assim o agente nunca trava esperando resposta
+(um prompt ignorado às 3h paralisa o trabalho) e nada some de vez.
+
+    unity-trash <caminho> [<caminho>...]
+
+Cada item vai para ~/.trash-agent/<AAAA-MM-DD>/<HHMMSS>-<nome>, e o caminho
+original fica registrado em manifest.jsonl no mesmo diretório do dia — sem ele
+a restauração vira adivinhação, porque o nome do arquivo não diz de onde veio.
+
+Esvaziar a lixeira é ato humano, deliberado: nada aqui apaga nada.
+"""
+import json
+import os
+import shutil
+import sys
+from datetime import datetime
+from pathlib import Path
+
+RAIZ = Path.home() / ".trash-agent"
+
+
+def main(argv):
+    if not argv:
+        print("uso: unity-trash <caminho> [<caminho>...]", file=sys.stderr)
+        return 2
+
+    agora = datetime.now()
+    destino_dia = RAIZ / agora.strftime("%Y-%m-%d")
+    destino_dia.mkdir(parents=True, exist_ok=True)
+    manifest = destino_dia / "manifest.jsonl"
+
+    falhas = 0
+    for bruto in argv:
+        origem = Path(bruto).expanduser()
+        if not origem.exists() and not origem.is_symlink():
+            print(f"não existe, ignorado: {origem}", file=sys.stderr)
+            falhas += 1
+            continue
+
+        origem_abs = origem.resolve() if not origem.is_symlink() else origem.absolute()
+
+        # Recusa mover a própria lixeira para dentro dela.
+        if RAIZ == origem_abs or RAIZ in origem_abs.parents:
+            print(f"recusado (é a própria lixeira): {origem_abs}", file=sys.stderr)
+            falhas += 1
+            continue
+
+        alvo = destino_dia / f"{agora.strftime('%H%M%S')}-{origem_abs.name}"
+        # Sufixo numérico em colisão: dois arquivos de mesmo nome no mesmo
+        # segundo se sobrescreveriam, e sobrescrever aqui é perder dado.
+        n = 1
+        while alvo.exists():
+            alvo = destino_dia / f"{agora.strftime('%H%M%S')}-{n}-{origem_abs.name}"
+            n += 1
+
+        try:
+            # shutil.move atravessa sistema de arquivos; Path.rename não.
+            shutil.move(str(origem_abs), str(alvo))
+        except Exception as exc:
+            print(f"falhou: {origem_abs} -> {exc}", file=sys.stderr)
+            falhas += 1
+            continue
+
+        with open(manifest, "a") as fh:
+            fh.write(json.dumps({
+                "ts": agora.isoformat(timespec="seconds"),
+                "origem": str(origem_abs),
+                "destino": str(alvo),
+            }, ensure_ascii=False) + "\n")
+        print(f"movido para a lixeira: {origem_abs} -> {alvo}")
+
+    if falhas:
+        print(f"\n{falhas} item(ns) não foram movidos.", file=sys.stderr)
+    print(f"\nrestaurar: consulte {manifest}")
+    return 1 if falhas else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

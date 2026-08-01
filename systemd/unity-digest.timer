@@ -1,0 +1,10 @@
+[Unit]
+Description=Dispara o digest de andamento 2x por dia em dias uteis
+
+[Timer]
+OnCalendar=Mon..Fri 09:07
+OnCalendar=Mon..Fri 18:07
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,8 @@
+{
+  "dmPolicy": "allowlist",
+  "allowFrom": ["SEU_ID_NUMERICO_DO_TELEGRAM"],
+  "groups": {},
+  "pending": {},
+  "ackReaction": "👀",
+  "chunkMode": "newline"
+}

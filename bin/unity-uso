@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+"""Uma linha com o consumo dos três modelos, para o supervisor colar no Telegram.
+
+Cada número vem da fonte que de fato sabe, e não de estimativa:
+
+- CLAUDE: `ai-usagebar --vendor anthropic`, que lê a cota real da assinatura —
+  janela de 5 h e janela de 7 dias. É o mesmo dado da status line do terminal.
+- DEEPSEEK: o ledger do llm-router (~/.local/share/llm-router/<data>.jsonl).
+  Melhor que perguntar ao vendor: registra tokens E custo por chamada, já
+  separados por componente, e é local (não gasta requisição nem depende de rede).
+- GEMINI: a cota do Antigravity **não é legível aqui**. O ai-usagebar só a
+  obtém enquanto o app ou uma sessão `agy` INTERATIVA estiver de pé, e os
+  despachos são `agy -p` curtos e não-interativos. Então reportamos o que dá
+  para saber com honestidade: quantos despachos foram feitos hoje.
+
+`--linha` imprime o formato compacto de rodapé; sem argumento, imprime o
+detalhado. Nunca levanta exceção: uma fonte muda não pode derrubar a resposta.
+"""
+import json
+import re
+import subprocess
+import sys
+from datetime import date
+from pathlib import Path
+
+LEDGER = Path.home() / ".local/share/llm-router"
+DESPACHOS = Path.home() / ".local/share/unity-orquestrador/despachos.jsonl"
+USAGEBAR = "/home/reaper/.local/bin/ai-usagebar"
+
+
+def claude():
+    """(pct_5h, reset_5h, pct_7d, reset_7d) — ou None se a fonte não responder."""
+    try:
+        p = subprocess.run(
+            [USAGEBAR, "--vendor", "anthropic", "--json",
+             "--format", "{session_pct}|{session_reset}|{weekly_pct}|{weekly_reset}"],
+            capture_output=True, text=True, timeout=25)
+        texto = re.sub("<[^>]+>", "", json.loads(p.stdout)["text"])
+        partes = texto.split("|")
+        return partes if len(partes) == 4 else None
+    except Exception:
+        return None
+
+
+def deepseek_hoje():
+    """Tokens de entrada, de saída e custo em USD gastos hoje pelo roteador."""
+    caminho = LEDGER / f"{date.today().isoformat()}.jsonl"
+    entrada = saida = 0
+    custo = 0.0
+    if not caminho.exists():
+        return entrada, saida, custo
+    for linha in caminho.read_text().splitlines():
+        try:
+            r = json.loads(linha)
+        except Exception:
+            continue
+        entrada += r.get("prompt_tokens") or 0
+        saida += r.get("completion_tokens") or 0
+        custo += r.get("cost_usd") or 0.0
+    return entrada, saida, custo
+
+
+def gemini_hoje():
+    """Despachos concluídos hoje no nível gemini. Proxy, não cota."""
+    if not DESPACHOS.exists():
+        return 0
+    hoje = date.today().isoformat()
+    vistos = {}
+    for linha in DESPACHOS.read_text().splitlines():
+        try:
+            r = json.loads(linha)
+        except Exception:
+            continue
+        vistos[r["id"]] = r
+    n = 0
+    for r in vistos.values():
+        if r.get("nivel") != "gemini":
+            continue
+        ts = r.get("terminado_em") or r.get("iniciado_em") or 0
+        if date.fromtimestamp(ts).isoformat() == hoje:
+            n += 1
+    return n
+
+
+def humano(n):
+    return f"{n/1000:.1f}k".replace(".0k", "k") if n >= 1000 else str(n)
+
+
+def main():
+    compacto = "--linha" in sys.argv
+    c = claude()
+    din, dout, dcusto = deepseek_hoje()
+    g = gemini_hoje()
+
+    if compacto:
+        # DUAS linhas curtas, não uma longa. Medido numa tela de celular: uma
+        # linha só passava de 80 caracteres e quebrava em três pedaços tortos,
+        # com número separado da unidade. Cada linha aqui fica abaixo de ~32
+        # caracteres, que é o que cabe sem quebra no Telegram do telefone.
+        usd = f"{dcusto:.2f}".replace(".", ",")
+        print(f"📊 Claude {c[0]}% 5h · {c[2]}% 7d" if c else "📊 Claude s/ dado")
+        print(f"DeepSeek US$ {usd} · Gemini {g}")
+        return 0
+
+    print("Consumo de hoje\n")
+    if c:
+        print(f"  Claude    {c[0]}% da janela de 5h (zera em {c[1]})")
+        print(f"            {c[2]}% da semana (zera em {c[3]})")
+    else:
+        print("  Claude    sem dado (ai-usagebar não respondeu)")
+    print(f"  DeepSeek  {humano(din)} entrada + {humano(dout)} saída = "
+          f"US$ {dcusto:.4f}".replace(".", ","))
+    print(f"  Gemini    {g} despacho(s) — cota da assinatura não é legível "
+          f"fora de sessão agy interativa")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as exc:
+        print(f"unity-uso falhou: {exc}", file=sys.stderr)
+        sys.exit(0)

@@ -1,0 +1,6 @@
+[Unit]
+Description=Avisa no Telegram quando algo novo fica em aberto
+
+[Service]
+Type=oneshot
+ExecStart=/home/reaper/.local/bin/unity-pendencias-telegram

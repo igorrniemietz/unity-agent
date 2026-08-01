@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""Desembrulha o envelope <channel> antes de entregar o evento ao ai-memory.
+
+POR QUE EXISTE (medido em 2026-08-01)
+
+O plugin do Telegram entrega o texto do Igor dentro de um envelope XML:
+
+    <channel source="plugin:telegram:telegram" chat_id="SEU_CHAT_ID"
+             message_id="97" user="..." ts="...">
+    cria pra mim um monitoramento de tokens do agente orquestrador
+    </channel>
+
+A primeira linha desse envelope tem ~140 caracteres. O ai-memory titula a
+página da sessão com os ~80 primeiros caracteres do primeiro prompt — ou seja,
+o corte cai SEMPRE dentro da tag e o texto humano nunca aparece. Todas as
+páginas de sessão do projeto ficaram tituladas assim:
+
+    <channel source="plugin:telegram:telegram" chat_id="SEU_CHAT_ID"…
+
+Isso estraga duas coisas de uma vez:
+
+1. TÍTULO — inútil. Nenhuma página diz do que a sessão tratou.
+2. BUSCA — pior ainda. O envelope injeta "telegram", "plugin", "channel",
+   "source" e "chat_id" em TODA página. Um `memory_query` por
+   "supervisor telegram dispatch cost" devolveu as seis páginas de sessão em
+   cima de qualquer coisa útil: o casamento foi no boilerplate, não no
+   conteúdo. O envelope não só não ajuda — ele afoga o índice.
+
+O conserto certo seria no ai-memory, mas ele é uma imagem Docker de terceiro.
+Então desembrulhamos aqui, no caminho do hook, que é código do Igor.
+
+REGRA DE OURO: este script está no caminho de TODO evento de hook. Se ele
+falhar, o evento tem de passar mesmo assim, intacto. Nenhuma exceção sobe, e o
+stdin original é sempre o fallback.
+
+Uso (no settings.json, no lugar da chamada direta ao binário):
+    unity-ai-memory-hook --event user-prompt-submit --agent claude-code ...
+Todos os argumentos são repassados sem alteração ao binário do ai-memory.
+"""
+import json
+import re
+import subprocess
+import sys
+
+AI_MEMORY = "/home/reaper/.local/bin/ai-memory"
+DATA_DIR = "/home/reaper/.local/share/ai-memory"
+
+# Casa o envelope inteiro e captura o miolo. DOTALL porque o texto do Igor tem
+# quebra de linha; non-greedy para não engolir dois envelopes numa tacada.
+ENVELOPE = re.compile(r"<channel\s+([^>]*)>\s*(.*?)\s*</channel>", re.DOTALL)
+FONTE = re.compile(r'source="plugin:([^:"]+)')
+
+
+def desembrulhar(texto):
+    """'<channel source=...>oi</channel>'  ->  '[telegram] oi'
+
+    Mantém o nome do canal como prefixo curto: saber que veio do Telegram tem
+    valor, os 140 caracteres de atributos não têm. Texto sem envelope volta
+    inalterado.
+    """
+    if not isinstance(texto, str) or "<channel" not in texto:
+        return texto
+
+    partes = []
+    for atributos, miolo in ENVELOPE.findall(texto):
+        fonte = FONTE.search(atributos)
+        rotulo = fonte.group(1) if fonte else "channel"
+        partes.append(f"[{rotulo}] {miolo}".strip())
+
+    if not partes:
+        return texto  # tag malformada: não invente, entregue o original
+    return "\n\n".join(partes)
+
+
+def main():
+    bruto = sys.stdin.buffer.read()
+    saida = bruto  # fallback: o que chegou é o que segue
+
+    try:
+        payload = json.loads(bruto)
+        # `prompt` é o campo do UserPromptSubmit. Os outros eventos não o têm e
+        # passam direto — o .get() cobre os dois casos sem ramificar por evento.
+        original = payload.get("prompt")
+        limpo = desembrulhar(original)
+        if limpo != original:
+            payload["prompt"] = limpo
+            saida = json.dumps(payload).encode()
+    except Exception:
+        pass  # payload não-JSON ou formato novo: repassa cru, nunca quebra
+
+    proc = subprocess.run(
+        [AI_MEMORY, "--data-dir", DATA_DIR, "hook"] + sys.argv[1:],
+        input=saida)
+    return proc.returncode
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception:
+        sys.exit(0)  # hook quebrado não pode derrubar a sessão do Igor

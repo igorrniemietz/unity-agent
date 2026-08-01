@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+"""Hook PreToolUse: força confirmação quando o comando apaga arquivo.
+
+Existe porque regra de permissão (`Bash(rm *)`) casa por PREFIXO, e comando
+real quase nunca começa no verbo perigoso: `cd /tmp && rm -rf x` passaria
+batido. Aqui o comando inteiro é inspecionado.
+
+Contrato: devolve permissionDecision "ask" quando detecta exclusão; silêncio
+(exit 0, stdout vazio) quando não detecta, deixando a decisão para o
+defaultMode. Nunca devolve "deny": o pedido foi confirmar, não bloquear.
+
+Falha aberto de propósito — se este script quebrar, o agente volta ao
+comportamento normal do defaultMode em vez de travar. O custo de um falso
+negativo aqui é uma confirmação a menos; o de travar é o agente inútil.
+"""
+import json
+import re
+import sys
+
+# Cada padrão é ancorado em início de comando ou depois de um separador
+# (; && || | & ( ou início da linha), para não casar dentro de outra palavra
+# nem dentro do nome de um arquivo — "confirm.sh" não deve virar confirmação.
+SEP = r"(?:^|[\n;&|(]|&&|\|\||\bsudo\s+|\bxargs\s+|\bnohup\s+|\btime\s+)\s*"
+PADROES = [
+    (rf"{SEP}rm\b",                     "rm"),
+    (rf"{SEP}rmdir\b",                  "rmdir"),
+    (rf"{SEP}shred\b",                  "shred"),
+    (rf"{SEP}unlink\b",                 "unlink"),
+    (rf"{SEP}trash\b",                  "trash"),
+    (r"\bfind\b[^\n;&|]*\s-delete\b",   "find -delete"),
+    (r"\bfind\b[^\n;&|]*-exec\s+rm\b",  "find -exec rm"),
+    (rf"{SEP}git\s+clean\b",            "git clean"),
+    (rf"{SEP}git\s+rm\b",               "git rm"),
+    (r"\bdocker\s+(?:volume|image|container|system)\s+(?:rm|prune)\b", "docker rm/prune"),
+    (rf"{SEP}truncate\b[^\n;&|]*-s\s*0\b", "truncate -s 0"),
+]
+
+
+def main():
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:
+        return
+
+    if payload.get("tool_name") not in ("Bash", "BashOutput"):
+        return
+
+    cmd = ((payload.get("tool_input") or {}).get("command") or "")
+    if not cmd:
+        return
+
+    for rx, nome in PADROES:
+        if re.search(rx, cmd):
+            print(json.dumps({
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "ask",
+                    "permissionDecisionReason":
+                        f"Comando apaga dados ({nome}). Confirmação exigida — "
+                        f"o resto roda sem perguntar.",
+                }
+            }))
+            return
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        pass
+    sys.exit(0)

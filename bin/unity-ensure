@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# Garante que existe UMA sessão de fundo dona do canal do Telegram.
+#
+# Por que isto existe: `claude daemon --help` diz, com todas as letras, que
+# "service install is disabled in this version — the daemon runs on demand and
+# exits when the last client disconnects". Ou seja, não há como pedir ao Claude
+# Code que mantenha o supervisor vivo. Sem este laço, o agente morre quando o
+# último cliente desconecta e o canal fica órfão: o servidor do plugin continua
+# consumindo getUpdates e entregando a ninguém — mensagem some sem erro.
+#
+# Idempotente de propósito: rodar de minuto em minuto não deve criar nada novo
+# quando já está tudo certo.
+set -uo pipefail
+export PATH="$HOME/.nvm/versions/node/v24.18.0/bin:$HOME/.local/bin:/usr/bin:/bin"
+
+# A sessão de fundo HERDA o cwd de quem a lança, e a unit do systemd não define
+# WorkingDirectory — então o diretório do supervisor dependia de quem chamou o
+# script. Rodando à mão a partir de /tmp em 2026-07-31, a sessão nasceu com
+# cwd=/tmp: o transcript foi para ~/.claude/projects/-tmp/ e o ai-memory
+# passaria a arquivar as observações dele num projeto "tmp" de mentira.
+# Fixar aqui cobre os dois caminhos de invocação (timer e mão).
+cd "$HOME" || exit 1
+
+SETTINGS="$HOME/.claude/supervisor-settings.json"
+CANAL="plugin:telegram@claude-plugins-official"
+
+# Instruções do orquestrador, em três arquivos com papéis distintos:
+#   persona.md    — como ele fala (formato e tom das mensagens no Telegram)
+#   roteamento.md — como ele decide (responder x despachar, e para qual executor)
+#   projetos.md   — para onde ele despacha (índice com apelidos e caminhos)
+#
+# Vêm por --append-system-prompt e não por CLAUDE.md: o cwd do supervisor é
+# $HOME, e um CLAUDE.md ali valeria para TODA sessão aberta na home, não só para
+# ele. Injetar no lançamento também garante que sobrevivem à recriação da sessão
+# pelo timer — sessão nova nasce com contexto zero, então o que não está em
+# disco não existe. Somados dão ~3k tokens, pagos uma vez por sessão.
+ORQ="$HOME/.claude/orquestrador"
+INSTRUCOES="$ORQ/persona.md $ORQ/roteamento.md $ORQ/projetos.md"
+LOG="$HOME/.local/share/unity-supervisor/ensure.log"
+mkdir -p "$(dirname "$LOG")"
+
+log() { printf '%s %s\n' "$(date -Is)" "$*" >> "$LOG"; }
+
+# Um servidor do plugin com TTY pertence a uma sessão interativa, não ao agente
+# de fundo — e como o Telegram só aceita um consumidor de getUpdates por token,
+# ele rouba a fila. O de fundo aparece com tty "?".
+servidores_com_tty() { ps -eo tty,args | grep -E '[s]erver[.]ts' | grep -vc '^?' ; }
+servidores_total()   { ps -eo args    | grep -cE '[s]erver[.]ts' ; }
+
+# `claude agents --json` sobe um processo node de ~120 MB e fala com o daemon
+# pelo socket. Sem timeout, um daemon ocupado devolve nada e o script LIA isso
+# como "não há agente" — recriava a sessão por cima de uma que estava viva.
+# 25 s é folgado: as medições do systemd mostram a chamada entre 0,5 s e 2 s.
+agentes_de_fundo() {
+  timeout 25 claude agents --json 2>/dev/null \
+    | python3 -c 'import sys,json
+try:
+    d=json.load(sys.stdin); a=d if isinstance(d,list) else d.get("agents",[])
+    # só os de fundo têm "id"; a sessão interativa aparece sem ele e não conta
+    print(" ".join(x["id"] for x in a if x.get("id")))
+except Exception: pass' 2>/dev/null
+}
+
+# Estado entre execuções, para o amortecedor (ver adiante).
+FALHA="$HOME/.local/share/unity-supervisor/falha-anterior"
+
+if [ "$(servidores_com_tty)" -gt 0 ]; then
+  log "AVISO: servidor do plugin com TTY — sessão interativa disputando getUpdates"
+fi
+
+# As duas condições são medidas SEPARADAMENTE e registradas com nome. Antes o
+# log dizia só "canal ausente (agentes/servidor)" — sem dizer qual das duas
+# falhou, e foi exatamente essa falta que fez a investigação de 2026-08-01
+# custar horas de arqueologia em daemon.log e state.json. Diagnóstico que não
+# chega ao log não existe.
+AGENTES="$(agentes_de_fundo)"
+N_AGENTES=$(printf '%s' "$AGENTES" | wc -w)
+N_SERVIDORES=$(servidores_total)
+
+if [ "$N_AGENTES" -ge 1 ] && [ "$N_SERVIDORES" -ge 1 ]; then
+  rm -f "$FALHA"
+  exit 0
+fi
+
+MOTIVO="agentes=$N_AGENTES servidores=$N_SERVIDORES"
+
+# Amortecedor: só recria depois de VER A FALHA DUAS VEZES SEGUIDAS. Uma sessão
+# nova custa ~19 mil tokens de cota só para nascer (cache do system prompt), e
+# em 2026-07-31 o laço recriou 10 sessões num dia — cada respawn vira uma
+# página de sessão no ai-memory e uma persona repaga do zero. Se a falha for um
+# piscar (daemon ocupado, servidor reiniciando), a próxima passada em 2 min já
+# encontra tudo de pé e nada é criado. Se for real, o atraso é de 2 minutos.
+if [ ! -f "$FALHA" ]; then
+  printf '%s' "$MOTIVO" > "$FALHA"
+  log "canal ausente ($MOTIVO) — 1ª detecção, aguardando confirmação na próxima passada"
+  exit 0
+fi
+
+log "canal ausente ($MOTIVO) confirmado (antes: $(cat "$FALHA" 2>/dev/null)). Limpando e recriando."
+rm -f "$FALHA"
+
+# Agente vivo com servidor morto: o canal não volta sozinho, porque o servidor
+# do plugin é um MCP stdio que só nasce junto com a sessão — não dá para
+# reconectar um novo à sessão antiga. Então a sessão órfã tem de SAIR antes de
+# subir a substituta. Sem isto ficariam duas sessões de fundo vivas, as duas
+# donas do mesmo canal: exatamente a duplicata que o Igor via.
+if [ "$N_AGENTES" -ge 1 ]; then
+  for id in $AGENTES; do
+    timeout 25 claude stop "$id" >/dev/null 2>&1 \
+      && log "sessão órfã $id encerrada (estava sem servidor de canal)" \
+      || log "AVISO: falha ao encerrar sessão órfã $id"
+  done
+  sleep 2
+fi
+
+# Matar por PID: `pkill -f 'server.ts'` casa com a própria linha de comando do
+# shell que o executa e derruba o próprio script (exit 144, já aconteceu).
+for pid in $(ps -eo pid,args | grep -E '[s]erver[.]ts' | awk '{print $1}'); do
+  kill "$pid" 2>/dev/null && log "servidor órfão $pid encerrado"
+done
+sleep 2
+
+# As instruções são opcionais por decisão: se um arquivo sumir, o supervisor
+# sobe sem ele em vez de não subir. Agente burro no ar é melhor que agente
+# esperto morto — e a falta aparece no log, não em silêncio.
+PROMPT_EXTRA=""
+for arq in $INSTRUCOES; do
+  if [ -r "$arq" ]; then
+    PROMPT_EXTRA="${PROMPT_EXTRA}$(cat "$arq")
+
+"
+  else
+    log "AVISO: instrução ilegível, seguindo sem ela: $arq"
+  fi
+done
+
+if [ -n "$PROMPT_EXTRA" ]; then
+  UNITY_NO_TELEGRAM_HOOK=1 claude --bg --channels "$CANAL" --settings "$SETTINGS" \
+    --append-system-prompt "$PROMPT_EXTRA" \
+    >> "$LOG" 2>&1 && log "agente de fundo recriado (com instruções)" || log "FALHA ao recriar"
+else
+  log "AVISO: nenhuma instrução legível — subindo sem elas"
+  UNITY_NO_TELEGRAM_HOOK=1 claude --bg --channels "$CANAL" --settings "$SETTINGS" \
+    >> "$LOG" 2>&1 && log "agente de fundo recriado (sem persona)" || log "FALHA ao recriar"
+fi

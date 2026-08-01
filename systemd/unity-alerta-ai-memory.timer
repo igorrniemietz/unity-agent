@@ -1,0 +1,14 @@
+[Unit]
+Description=Verifica o gasto do ai-memory de tempos em tempos
+
+[Timer]
+# A cada 30 min. O agendador do ai-memory dispara sozinho, sem ninguem pedir,
+# e uma rajada pode acontecer com o dono longe do PC — verificar so no resumo
+# das 21:40 seria descobrir tarde. O alerta so fala ao cruzar patamar novo,
+# entao rodar de meia em meia hora nao gera mensagem de meia em meia hora.
+OnCalendar=*:0/30
+Persistent=false
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""Avisa no Telegram quando algo NOVO fica em aberto. Roda por timer.
+
+Separado do `unity-pendencias` pelo mesmo motivo que `unity-costs-telegram` é
+separado do `unity-costs`: relatar e avisar são decisões diferentes. O relatório
+responde quando o Igor pergunta; o aviso decide sozinho se vale interromper.
+
+REGRA CENTRAL — avisa por MUDANÇA, não por existência.
+
+Um alerta que dispara "toda vez que existe pendência" vira ruído em meia hora:
+a mesma sessão parada geraria a mesma mensagem de 30 em 30 minutos até alguém
+mexer, e alerta que repete é alerta que se aprende a ignorar. Então o estado
+em disco guarda o CONJUNTO de itens já avisados. Só fala quando entra item
+novo. Item que sai não gera mensagem — resolver não é notícia.
+
+    unity-pendencias-telegram              verifica e avisa se mudou
+    unity-pendencias-telegram --dry-run    mostra o que faria, não manda nem grava
+    unity-pendencias-telegram --forcar     manda o estado atual, ignorando o que
+                                        já foi avisado
+"""
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+PENDENCIAS = "/home/reaper/.local/bin/unity-pendencias"
+ESTADO = Path.home() / ".local/share/unity-supervisor/alerta-pendencias.json"
+HORAS = "1"
+
+
+def carregar_lib():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "unity_lib", "/home/reaper/.local/bin/unity-lib.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def levantar():
+    """(texto_do_relatorio, chaves) — chaves identificam cada item em aberto.
+
+    A chave da sessão e do despacho é o id; a da memória é o caminho da página.
+    São estáveis entre execuções, que é o que o comparador exige. O tempo
+    parado NÃO entra na chave de propósito: ele muda a cada verificação e faria
+    todo item parecer novo sempre.
+    """
+    try:
+        p = subprocess.run([PENDENCIAS, "--horas", HORAS],
+                           capture_output=True, text=True, timeout=120)
+        texto = p.stdout.strip()
+    except Exception:
+        return "", set()
+
+    if not texto or texto.startswith("✅"):
+        return texto, set()
+
+    chaves = set()
+    for linha in texto.splitlines():
+        linha = linha.strip()
+        # "aa11bb22 — parada há 4h12"  /  "394f6abc — gemini → adega-pilar"
+        if " — " in linha:
+            chaves.add("item:" + linha.split(" — ")[0].strip())
+        elif linha.endswith(".md"):
+            chaves.add("mem:" + linha)
+    return texto, chaves
+
+
+def main():
+    seco = "--dry-run" in sys.argv
+    forcar = "--forcar" in sys.argv
+
+    texto, chaves = levantar()
+
+    try:
+        avisadas = set(json.loads(ESTADO.read_text()).get("avisadas", []))
+    except Exception:
+        avisadas = set()
+
+    novas = chaves - avisadas
+
+    if seco:
+        print(f"em aberto agora : {sorted(chaves)}")
+        print(f"já avisadas     : {sorted(avisadas)}")
+        print(f"novas           : {sorted(novas)}")
+        print(f"mandaria aviso  : {bool(novas) or forcar}")
+        return 0
+
+    # Sempre grava o conjunto atual, mesmo sem mandar nada: é assim que um item
+    # resolvido some da lista e volta a poder alertar se reaparecer.
+    ESTADO.parent.mkdir(parents=True, exist_ok=True)
+    ESTADO.write_text(json.dumps({"avisadas": sorted(chaves)}))
+
+    if not (novas or forcar) or not chaves:
+        return 0
+
+    lib = carregar_lib()
+    # silent=False: o ponto do aviso é o telefone apitar. Se fosse para ele
+    # descobrir só quando abrisse o app, bastava o rodapé do unity-uso.
+    lib.send_telegram(texto, silent=False)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception:
+        sys.exit(0)  # timer não pode falhar barulhento

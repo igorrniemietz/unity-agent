@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+"""Hook Stop -> notificação no Telegram, resumida e legível no celular.
+
+Lê o payload do hook no stdin (que já traz last_assistant_message e
+background_tasks) e manda um aviso curto.
+
+REGRA CRÍTICA: sai SEMPRE com 0, e SEMPRE rápido. O Stop é um hook que bloqueia
+— exit != 0 impede o Claude de encerrar o turno, e demora aqui é demora que o
+dono sente em toda sessão. Por isso o trabalho pesado (chamar a DeepSeek) roda
+num processo DESTACADO: o hook enfileira e volta na hora.
+
+Por que resumir com LLM em vez de só mandar o texto: a resposta final de uma
+sessão é escrita para o terminal — markdown com `##`, `**` e crase. O canal do
+Telegram manda texto puro, então esses símbolos aparecem crus na tela, e o texto
+vem longo e técnico demais para ler no celular. Foi a queixa do dono.
+
+A limpeza determinística de markdown existe como rede: se a DeepSeek estiver
+fora, o teto do dia tiver estourado ou a resposta demorar, o aviso sai mesmo
+assim — mais feio, nunca ausente.
+
+Custo: ~US$ 0,0002 por aviso, e o anti-spam limita a um aviso por sessão a cada
+15 min.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, str(Path.home() / ".local/bin"))
+
+STATE = Path.home() / ".local/share/unity-supervisor"
+MIN_INTERVAL_SECS = 900   # no máximo uma notificação por sessão a cada 15 min
+MIN_TURN = 3              # ignora trocas curtas
+ROUTER = "http://127.0.0.1:8787/notify/v1/chat/completions"
+LIMITE_CRU = 6000         # o que mandamos para a DeepSeek resumir
+TIMEOUT_LLM = 45
+
+# Curta de propósito, e isso foi MEDIDO. Uma versão longa com oito regras fazia
+# a deepseek-v4-flash gastar o orçamento inteiro de saída raciocinando e devolver
+# conteúdo VAZIO — com 700 e com 2000 tokens, sempre `finish_reason: length` e
+# 100% dos tokens em raciocínio. Com esta versão: 6 de 6 execuções completas,
+# entre 5 e 8 segundos. Antes de acrescentar regra aqui, rode 3 vezes e confira
+# que ainda volta conteúdo.
+#
+# A largura de linha NÃO é pedida ao modelo — é imposta depois, no código. Pedir
+# foi justamente uma das regras que inchava o raciocínio, e largura é coisa que
+# se resolve com contador, não com pedido.
+INSTRUCAO = (
+    "Rewrite as a phone notification in Brazilian Portuguese. "
+    "Max 5 short lines, plain text, no markdown. "
+    "Say what changed for the user, not the steps. "
+    "Avoid jargon: write for a smart non-programmer. "
+    "Keep at most one URL."
+)
+LARGURA = 40
+
+
+def limpar_markdown(texto):
+    """Rede de segurança: tira a sintaxe que o Telegram mostraria crua."""
+    t = re.sub(r"```[a-zA-Z]*\n?", "", texto)          # cercas de código
+    t = re.sub(r"`([^`]*)`", r"\1", t)                 # crase inline
+    t = re.sub(r"\*\*([^*]*)\*\*", r"\1", t)           # negrito
+    t = re.sub(r"(?m)^#{1,6}\s*", "", t)               # títulos
+    t = re.sub(r"(?m)^\s*[-*]\s+", "· ", t)            # marcadores
+    t = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1: \2", t)  # links markdown
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
+
+
+def quebrar(texto, largura=LARGURA):
+    """Reparte linha longa em pedaços curtos, sem cortar palavra nem URL.
+
+    Linha longa quebra sozinha no Telegram do celular e separa número da
+    unidade — foi a queixa do dono. URL fica intacta numa linha só: partida ao
+    meio ela deixa de ser clicável, que é o único motivo de ela estar ali.
+    """
+    import textwrap
+    saida = []
+    for linha in texto.split("\n"):
+        if not linha.strip():
+            saida.append("")
+        elif "http://" in linha or "https://" in linha:
+            saida.append(linha.strip())
+        else:
+            saida.extend(textwrap.wrap(linha.strip(), largura) or [""])
+    return "\n".join(saida)
+
+
+def resumir(texto):
+    """Devolve o resumo da DeepSeek, ou None se algo não colaborar.
+
+    Duas tentativas: o v4-flash sempre raciocina, e de vez em quando gasta o
+    orçamento de saída inteiro pensando e devolve conteúdo vazio. Repetir custa
+    ~US$ 0,0002 e resolve; insistir mais que isso não vale o atraso.
+    """
+    corpo = json.dumps({
+        "model": "x",
+        "max_tokens": 800,
+        "temperature": 0.2,
+        "messages": [
+            {"role": "system", "content": INSTRUCAO},
+            {"role": "user", "content": texto[:LIMITE_CRU]},
+        ],
+    }).encode()
+    for _ in range(2):
+        req = urllib.request.Request(
+            ROUTER, data=corpo, headers={"Content-Type": "application/json"},
+            method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=TIMEOUT_LLM) as resp:
+                dados = json.loads(resp.read())
+            saida = (dados["choices"][0]["message"]["content"] or "").strip()
+            if saida:
+                return quebrar(limpar_markdown(saida))
+        except Exception:
+            return None
+    return None
+
+
+def worker(caminho):
+    """Processo destacado: resume, monta e envia. Erro aqui não afeta a sessão."""
+    try:
+        payload = json.loads(Path(caminho).read_text())
+    finally:
+        try:
+            os.unlink(caminho)
+        except Exception:
+            pass
+
+    from importlib.machinery import SourceFileLoader
+    lib = SourceFileLoader(
+        "unity_lib", str(Path.home() / ".local/bin/unity-lib.py")).load_module()
+
+    projeto = payload["projeto"]
+    msg = payload["msg"]
+    rodando = payload["rodando"]
+
+    corpo = None
+    if msg:
+        # Mensagem já curta não vale uma chamada de LLM: limpar basta.
+        corpo = resumir(msg) if len(msg) > 400 else None
+        if corpo is None:
+            corpo = quebrar(limpar_markdown(msg))
+            if len(corpo) > 700:
+                corpo = corpo[:700].rsplit("\n", 1)[0] + "\n…"
+
+    linhas = [f"✅ {projeto}"]
+    if corpo:
+        linhas += ["", corpo]
+    if rodando:
+        linhas += ["", f"⏳ {len(rodando)} em segundo plano"]
+
+    lib.send_telegram("\n".join(linhas))
+
+
+def main():
+    if len(sys.argv) > 2 and sys.argv[1] == "--worker":
+        return worker(sys.argv[2])
+
+    # A sessão que É o canal do Telegram não deve notificar por aqui: o plugin
+    # já respondeu ao usuário, e o Stop mandaria a mesma mensagem de novo. O
+    # anti-spam de 15 min não resolve — ele só espaça a duplicata.
+    if os.environ.get("UNITY_NO_TELEGRAM_HOOK") == "1":
+        return
+
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:
+        return
+
+    session = payload.get("session_id", "?")
+    cwd = payload.get("cwd", "")
+    projeto = os.path.basename(cwd.rstrip("/")) or "?"
+    turno = payload.get("turn_number") or 0
+    msg = (payload.get("last_assistant_message") or "").strip()
+    tarefas = payload.get("background_tasks") or []
+
+    if turno and turno < MIN_TURN and not tarefas:
+        return  # conversa curta: não vale notificação
+
+    STATE.mkdir(parents=True, exist_ok=True)
+    marker = STATE / f"last-notify-{session}"
+    now = time.time()
+    if marker.exists() and now - marker.stat().st_mtime < MIN_INTERVAL_SECS:
+        return  # anti-spam por sessão
+    marker.write_text(str(now))
+
+    fd, caminho = tempfile.mkstemp(prefix="unity-notify-", suffix=".json")
+    with os.fdopen(fd, "w") as fh:
+        json.dump({
+            "projeto": projeto,
+            "msg": msg,
+            "rodando": [t for t in tarefas if t.get("status") == "running"],
+        }, fh)
+
+    # start_new_session: o filho sobrevive ao fim do turno. Sem isso o resumo
+    # morreria junto com o hook e o aviso nunca sairia.
+    subprocess.Popen(
+        [sys.executable, __file__, "--worker", caminho],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL, start_new_session=True)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        pass  # nunca propagar erro: o Stop bloqueia a sessão
+    sys.exit(0)

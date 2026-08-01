@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""Digest periódico do andamento dos projetos, entregue no Telegram.
+
+Fluxo:
+  memory_briefing por projeto  ->  gate de atividade  ->  LLM  ->  Telegram
+
+O memory_briefing NÃO gasta token: é determinístico, read-only e sem LLM. Só
+depois de confirmar que houve atividade nova é que um modelo é chamado — e via
+llm-router, que impõe o teto diário e faz a cascata de fallback.
+
+Uso:
+    unity-digest              envia se houver novidade
+    unity-digest --dry-run    imprime, não envia, não chama LLM
+    unity-digest --force      ignora o gate de atividade
+"""
+import json
+import sys
+from datetime import datetime, timezone
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+
+lib = SourceFileLoader("unity_lib", str(Path.home() / ".local/bin/unity-lib.py")).load_module()
+
+STATE = Path.home() / ".local/share/unity-supervisor"
+WATERMARK = STATE / "digest-watermark.json"
+CACHE_PROJETOS = STATE / "projetos.json"
+WIKI_PROJECTS_CMD = (
+    "for d in /data/wiki/*/*/; do "
+    "n=$(find \"$d\" -name '*.md' ! -name '_meta.md' 2>/dev/null | wc -l); "
+    "[ \"$n\" -gt 0 ] || continue; "
+    "grep -m1 '^project:' \"$d/_meta.md\" 2>/dev/null | sed 's/project: *//'; done"
+)
+
+
+def _projetos_docker():
+    """Fonte canônica: o wiki dentro do container.
+
+    Não existe endpoint HTTP nem subcomando de CLI que liste projetos — a
+    /api/v1 foi desligada junto com o --enable-web. Mas esta via cai junto com
+    o daemon: em 2026-07-29 o `docker exec` passou a atingir um container
+    homônimo já parado, e o digest respondeu "sem atividade nova" por dois
+    turnos seguidos, sem erro nenhum. Falha silenciosa é o pior modo de falha
+    para um alerta, daí as fontes de reserva abaixo.
+    """
+    import subprocess
+    try:
+        r = subprocess.run(["docker", "exec", "ai-memory", "sh", "-c", WIKI_PROJECTS_CMD],
+                           capture_output=True, text=True, timeout=30)
+    except Exception:
+        return set()
+    if r.returncode != 0:
+        return set()
+    return {p.strip() for p in r.stdout.splitlines() if p.strip()}
+
+
+def _projetos_mcp():
+    """Reserva: deduz os projetos das buscas globais, que só dependem do HTTP.
+
+    Cada hit global vem anotado com o project_name de origem. A cobertura é
+    parcial por ser busca ranqueada, então isto complementa o cache — não o
+    substitui.
+    """
+    nomes = set()
+    for termo in ("session_id", "handoff OR projeto OR sessão"):
+        r = lib.mcp("memory_query", {"query": termo, "global": True, "limit": 100})
+        for hit in ((r or {}).get("global_hits") or []):
+            if hit.get("project_name"):
+                nomes.add(hit["project_name"])
+    return nomes
+
+
+def projetos():
+    """União das fontes disponíveis, com cache em disco como último recurso."""
+    nomes = _projetos_docker() | _projetos_mcp()
+    if nomes:
+        STATE.mkdir(parents=True, exist_ok=True)
+        CACHE_PROJETOS.write_text(json.dumps(sorted(nomes), ensure_ascii=False))
+        return sorted(nomes)
+    try:
+        return sorted(json.loads(CACHE_PROJETOS.read_text()))
+    except Exception:
+        return []
+
+
+def carregar_marca():
+    try:
+        return json.loads(WATERMARK.read_text())
+    except Exception:
+        return {}
+
+
+def main():
+    dry = "--dry-run" in sys.argv
+    force = "--force" in sys.argv
+
+    marca = carregar_marca()
+    nova_marca = {}
+    ativos = []
+
+    projs = projetos()
+    if not projs:
+        # Distinto de "nada aconteceu": aqui o digest não conseguiu sequer
+        # descobrir o que observar. Sai != 0 para o systemd registrar falha em
+        # vez de a rodada passar por silêncio legítimo.
+        print("nenhuma fonte de projetos respondeu (docker, MCP e cache). "
+              "O digest não tem o que observar.", file=sys.stderr)
+        return 1
+
+    for proj in projs:
+        br = lib.mcp("memory_briefing", {"project": proj, "recent_pages_limit": 4})
+        if not br:
+            continue
+        ultimo = br.get("last_observation_at") or ""
+        nova_marca[proj] = ultimo
+        if not force and marca.get(proj) == ultimo:
+            continue  # nada novo desde a última rodada
+        a7 = br.get("activity_7d") or {}
+        if not (a7.get("observations") or a7.get("sessions")):
+            continue
+        ativos.append({
+            "projeto": proj,
+            "ultima_atividade": ultimo,
+            "sessoes_7d": a7.get("sessions"),
+            "observacoes_7d": a7.get("observations"),
+            "handoffs_pendentes": br.get("pending_handoff_count"),
+            "paginas_recentes": [
+                {"titulo": (p.get("title") or "")[:120], "atualizado": p.get("updated_at")}
+                for p in (br.get("recent_pages") or [])[:4]
+            ],
+        })
+
+    if not ativos:
+        print("sem atividade nova desde a última rodada — nenhum token gasto.")
+        if not dry:
+            STATE.mkdir(parents=True, exist_ok=True)
+            WATERMARK.write_text(json.dumps(nova_marca))
+        return 0
+
+    ativos.sort(key=lambda p: p.get("ultima_atividade") or "", reverse=True)
+    dados = json.dumps(ativos, ensure_ascii=False, indent=1)
+
+    if dry:
+        print(dados)
+        print(f"\n[dry-run] {len(ativos)} projeto(s) com novidade; LLM não foi chamado.")
+        return 0
+
+    agora = datetime.now(timezone.utc).astimezone().strftime("%d/%m %H:%M")
+    prompt = (
+        "Você resume andamento de projetos para o dono deles, no Telegram.\n"
+        "Escreva em português do Brasil, direto, sem saudação e sem repetir números crus.\n"
+        "Formato: uma linha por projeto, começando com '· ', dizendo o que avançou.\n"
+        "No fim, se houver handoff pendente, uma linha '⚠️' apontando qual projeto.\n"
+        "Máximo 10 linhas no total. Não invente nada que não esteja nos dados.\n"
+        "Os títulos de página são os pedidos originais do usuário — use-os para "
+        "descrever o trabalho.\n\n"
+        f"Dados:\n{dados}"
+    )
+
+    texto, erro = lib.llm(prompt, client="supervisor", max_tokens=1500)
+    if erro or not texto:
+        print(f"falha ao gerar o digest: {erro}", file=sys.stderr)
+        return 1
+
+    corpo = f"📊 Andamento — {agora}\n\n{texto.strip()}"
+    if lib.send_telegram(corpo, silent=True):
+        STATE.mkdir(parents=True, exist_ok=True)
+        WATERMARK.write_text(json.dumps(nova_marca))
+        print(f"digest enviado ({len(ativos)} projeto(s)).")
+        return 0
+
+    print("digest gerado mas o envio ao Telegram falhou; marca d'água preservada "
+          "para tentar de novo.", file=sys.stderr)
+    print(corpo)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

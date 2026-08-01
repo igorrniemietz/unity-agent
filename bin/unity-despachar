@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""Despacha uma tarefa para um executor, em segundo plano, e avisa no Telegram.
+
+Existe por três motivos medidos:
+
+1. `agy -p` e `claude -p` BLOQUEIAM por 30 a 180 s. Rodados direto no Bash da
+   sessão que é dona do canal do Telegram, eles deixam o bot mudo — o Igor manda
+   outra mensagem e não recebe nada, sem erro. Mesmo sintoma da briga de
+   getUpdates que já custou depuração.
+2. O `agy` IGNORA o diretório atual sem `--add-dir`: escreve em
+   ~/.gemini/antigravity-cli/scratch/ e ainda responde "criado com sucesso".
+   Aqui a flag é obrigatória, não opcional.
+3. A restrição de consumidor único do Telegram vale para RECEBER, não para
+   ENVIAR — `unity-lib.send_telegram` faz POST direto na Bot API. Então o processo
+   despachado avisa o Igor sozinho, sem precisar que o supervisor esteja
+   acordado nem disputar o canal.
+
+Uso:
+    unity-despachar --nivel claude|gemini --projeto <nome> --dir <caminho> "<tarefa>"
+    unity-despachar --lista
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+import uuid
+from datetime import datetime
+from pathlib import Path
+
+SPOOL = Path.home() / ".local/share/unity-orquestrador"
+LIB = "/home/reaper/.local/bin/unity-lib.py"
+LIMITE_AVISO = 2500  # caracteres do resultado que vão para o chat
+
+
+def carregar_lib():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("unity_lib", LIB)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def registrar(entrada):
+    SPOOL.mkdir(parents=True, exist_ok=True)
+    with open(SPOOL / "despachos.jsonl", "a") as fh:
+        fh.write(json.dumps(entrada, ensure_ascii=False) + "\n")
+
+
+def ativos():
+    """Despachos que começaram e não terminaram, por diretório.
+
+    Dois agentes escrevendo no mesmo repositório é a única concorrência que
+    corrompe — duas tarefas em projetos diferentes podem rodar juntas à vontade.
+    """
+    caminho = SPOOL / "despachos.jsonl"
+    if not caminho.exists():
+        return {}
+    estado = {}
+    for linha in caminho.read_text().splitlines():
+        try:
+            r = json.loads(linha)
+        except Exception:
+            continue
+        estado[r["id"]] = r
+    return {i: r for i, r in estado.items() if r.get("estado") == "rodando"}
+
+
+def listar():
+    vivos = ativos()
+    if not vivos:
+        print("nenhum despacho em andamento")
+        return 0
+    for i, r in vivos.items():
+        inicio = datetime.fromtimestamp(r["iniciado_em"]).strftime("%H:%M:%S")
+        print(f"{i}  {r['nivel']:7s} {r['projeto']:22s} desde {inicio}  {r['tarefa'][:50]}")
+    return 0
+
+
+def executar(args, ident):
+    """Roda o executor até o fim e avisa no Telegram. Chamado no processo filho."""
+    lib = carregar_lib()
+    inicio = time.time()
+
+    # Regra permanente do dono: o trabalho é em inglês, a entrega é em português.
+    # Português custa mais token que inglês para dizer a mesma coisa, e num
+    # pipeline que despacha e recebe relatório cada salto paga esse câmbio. O
+    # rodapé é anexado AQUI, e não deixado a cargo de quem chama, porque a
+    # economia só existe se valer em todo despacho — inclusive nos que o
+    # supervisor montar às pressas.
+    RODAPE = (f"\n\nProject directory: {args.dir}\n"
+              f"Use absolute paths.\n"
+              f"Work in English: reasoning, code, comments, commit messages.\n"
+              f"Deliver the FINAL SUMMARY in Portuguese (pt-BR), short — "
+              f"it goes straight to the user on Telegram.")
+
+    if args.nivel == "gemini":
+        # --add-dir é o que faz o agy enxergar o diretório de verdade; o caminho
+        # absoluto vai TAMBÉM no prompt porque só a flag não basta para ele
+        # entender onde escrever.
+        cmd = ["agy", "-p", args.tarefa + RODAPE, "--add-dir", args.dir,
+               "--dangerously-skip-permissions"]
+    else:
+        cmd = ["claude", "-p", args.tarefa + RODAPE, "--add-dir", args.dir,
+               "--permission-mode", "acceptEdits"]
+
+    try:
+        proc = subprocess.run(cmd, cwd=args.dir, capture_output=True, text=True,
+                              timeout=args.timeout)
+        saida = (proc.stdout or "").strip() or (proc.stderr or "").strip()
+        ok = proc.returncode == 0
+    except subprocess.TimeoutExpired:
+        saida, ok = f"estourou o tempo limite de {args.timeout}s", False
+    except FileNotFoundError as exc:
+        saida, ok = f"executor não encontrado: {exc}", False
+    except Exception as exc:
+        saida, ok = f"falhou: {exc}", False
+
+    dur = int(time.time() - inicio)
+    registrar({"id": ident, "estado": "terminado", "ok": ok, "nivel": args.nivel,
+               "projeto": args.projeto, "dir": args.dir, "tarefa": args.tarefa,
+               "terminado_em": time.time(), "duracao_s": dur,
+               "saida": saida[:4000]})
+
+    icone = "✅" if ok else "🔴"
+    executor = "Gemini" if args.nivel == "gemini" else "Claude"
+    corpo = saida if len(saida) <= LIMITE_AVISO else saida[:LIMITE_AVISO] + "\n… (cortado)"
+    lib.send_telegram(
+        f"{icone} {args.projeto} — {executor} terminou em {dur}s\n\n{corpo}",
+        silent=False)
+    return 0 if ok else 1
+
+
+def main():
+    p = argparse.ArgumentParser(description="Despacha tarefa para um executor.")
+    p.add_argument("--nivel", choices=["claude", "gemini"], help="executor")
+    p.add_argument("--projeto", help="nome do projeto, para o aviso e o spool")
+    p.add_argument("--dir", help="caminho absoluto do projeto")
+    p.add_argument("--timeout", type=int, default=1800, help="segundos (padrão 1800)")
+    p.add_argument("--lista", action="store_true", help="lista despachos em andamento")
+    p.add_argument("tarefa", nargs="?", help="o que fazer")
+    args = p.parse_args()
+
+    if args.lista:
+        return listar()
+
+    if not (args.nivel and args.projeto and args.dir and args.tarefa):
+        p.error("--nivel, --projeto, --dir e a tarefa são obrigatórios")
+
+    if not os.path.isdir(args.dir):
+        print(f"diretório não existe: {args.dir}", file=sys.stderr)
+        return 2
+
+    # Modo filho: o pai me relança com esta variável, e aqui eu de fato executo.
+    if os.environ.get("UNITY_DESPACHO_ID"):
+        return executar(args, os.environ["UNITY_DESPACHO_ID"])
+
+    # Recusa dois despachos no mesmo diretório — corromper repositório é o único
+    # dano que a concorrência causa aqui.
+    for i, r in ativos().items():
+        if os.path.realpath(r["dir"]) == os.path.realpath(args.dir):
+            print(f"já existe despacho rodando neste diretório: {i} "
+                  f"({r['tarefa'][:60]}). Espere ou use outro projeto.",
+                  file=sys.stderr)
+            return 3
+
+    ident = uuid.uuid4().hex[:8]
+    registrar({"id": ident, "estado": "rodando", "nivel": args.nivel,
+               "projeto": args.projeto, "dir": args.dir, "tarefa": args.tarefa,
+               "iniciado_em": time.time()})
+
+    # setsid + saída redirecionada: o filho sobrevive ao fim do turno do
+    # supervisor. Sem isso, o despacho morreria junto com o Bash que o criou.
+    log = SPOOL / f"{ident}.log"
+    env = dict(os.environ, UNITY_DESPACHO_ID=ident)
+    with open(log, "w") as fh:
+        subprocess.Popen(
+            [sys.executable, __file__, "--nivel", args.nivel,
+             "--projeto", args.projeto, "--dir", args.dir,
+             "--timeout", str(args.timeout), args.tarefa],
+            env=env, stdout=fh, stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL, start_new_session=True, cwd=args.dir)
+
+    print(f"despachado {ident} ({args.nivel} -> {args.projeto}). "
+          f"O resultado chega no Telegram. Log: {log}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

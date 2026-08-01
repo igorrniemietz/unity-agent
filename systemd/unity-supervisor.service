@@ -1,0 +1,8 @@
+[Unit]
+Description=Unity — mantem viva a sessao dona do canal do Telegram
+After=unity-daemon.service
+Wants=unity-daemon.service
+
+[Service]
+Type=oneshot
+ExecStart=/home/reaper/.local/bin/unity-ensure

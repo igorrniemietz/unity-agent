@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""Entrega ao ai-memory os eventos que ficaram encalhados no spool local.
+
+POR QUE EXISTE (medido em 2026-08-01)
+
+O hook do ai-memory escreve cada evento primeiro em
+`~/.local/share/ai-memory/hook-spool/` e só depois entrega ao servidor. Quando
+a entrega falha, o arquivo fica lá para ser reenviado. Em 01/08 às 09:26 a
+drenagem parou: a última observação a chegar ao banco foi de 09:26:14 e a
+partir daí TUDO ficou no spool, com `attempts: 0` — nem sequer uma tentativa.
+
+O servidor estava são o tempo todo: reenviando um arquivo do spool à mão, ele
+respondeu `202 queued`. Ou seja, o que quebrou foi o drenador do cliente, que é
+binário de terceiro (imagem Docker). Este script é a rede: reenvia o que está
+parado e apaga só o que o servidor confirmou.
+
+REGRA: só apaga em resposta 2xx. Qualquer outra coisa — erro de rede, 4xx, 5xx
+— deixa o arquivo onde está. Perder observação em silêncio é o defeito que
+estamos consertando; não vamos reproduzi-lo aqui.
+
+Uso:
+    unity-ai-memory-drenar            # drena
+    unity-ai-memory-drenar --conferir # só conta, não envia
+"""
+import json
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+SPOOL = Path.home() / ".local/share/ai-memory/hook-spool"
+TIMEOUT = 20
+
+
+def arquivos():
+    return sorted(SPOOL.glob("*.json"))
+
+
+def entregar(caminho):
+    """True se o servidor confirmou (2xx). Nunca levanta."""
+    try:
+        d = json.loads(caminho.read_text())
+    except Exception as exc:
+        print(f"  ilegível, mantido: {caminho.name} ({exc})")
+        return False
+
+    cabecalhos = {"Content-Type": "application/json"}
+    if d.get("token"):
+        cabecalhos["Authorization"] = "Bearer " + d["token"]
+
+    req = urllib.request.Request(
+        d["url"], data=d["body"].encode(), headers=cabecalhos, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+            return 200 <= resp.status < 300
+    except urllib.error.HTTPError as exc:
+        print(f"  HTTP {exc.code}, mantido: {caminho.name}")
+    except Exception as exc:
+        print(f"  falhou, mantido: {caminho.name} ({type(exc).__name__})")
+    return False
+
+
+def main():
+    pendentes = arquivos()
+    if not pendentes:
+        print("spool vazio")
+        return 0
+
+    if "--conferir" in sys.argv:
+        print(f"{len(pendentes)} evento(s) parado(s) no spool")
+        return 0
+
+    entregues = 0
+    for caminho in pendentes:
+        if entregar(caminho):
+            caminho.unlink(missing_ok=True)
+            entregues += 1
+
+    print(f"{entregues}/{len(pendentes)} entregues; {len(arquivos())} ainda no spool")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

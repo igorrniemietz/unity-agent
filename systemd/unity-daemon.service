@@ -1,0 +1,17 @@
+[Unit]
+Description=Unity — daemon do Claude Code (mantem vivas as sessoes de fundo)
+After=network-online.target
+
+[Service]
+Type=simple
+# `claude daemon run` roda o supervisor em primeiro plano. E o unico jeito de
+# manter o daemon vivo: o `service install` proprio esta desabilitado nesta
+# versao, e sem isso o daemon sai quando o ultimo cliente desconecta, levando
+# junto o agente do Telegram.
+ExecStart=/home/reaper/.nvm/versions/node/v24.18.0/bin/claude daemon run
+Restart=always
+RestartSec=5
+Environment=PATH=/home/reaper/.nvm/versions/node/v24.18.0/bin:/home/reaper/.local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target

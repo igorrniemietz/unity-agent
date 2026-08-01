@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""Manda o custo do dia no Telegram. Roda por timer, uma vez ao dia.
+
+O `unity-costs` já calcula tudo, mas imprime no terminal com barras e cores — o
+Igor não fica olhando terminal. Aqui vai a versão curta, no formato que ele
+pediu: texto puro, poucas linhas, e detalhe só quando importa.
+
+"Quando importa" é uma regra e não julgamento: só abre o detalhe por componente
+se o gasto passar de METADE do teto diário. Abaixo disso, uma linha basta —
+mandar tabela todo dia treina o olho a ignorar a mensagem, e aí ela deixa de
+avisar justamente no dia em que precisaria.
+
+    unity-costs-telegram             manda
+    unity-costs-telegram --dry-run   imprime o que mandaria
+"""
+import json
+import sys
+from datetime import date
+from pathlib import Path
+
+sys.path.insert(0, "/home/reaper/.local/bin")
+
+LEDGER = Path.home() / ".local/share/llm-router"
+PROVIDERS = Path.home() / "infra/llm-router/providers.json"
+DESPACHOS = Path.home() / ".local/share/unity-orquestrador/despachos.jsonl"
+
+
+def carregar_lib():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "unity_lib", "/home/reaper/.local/bin/unity-lib.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def humano(n):
+    return f"{n/1000:.0f}k" if n >= 1000 else str(n)
+
+
+def teto_deepseek():
+    try:
+        cfg = json.loads(PROVIDERS.read_text())
+        return cfg["providers"]["deepseek"].get("daily_cap_usd") or 0.5
+    except Exception:
+        return 0.5
+
+
+def ledger_hoje():
+    """Custo e tokens por componente, mais contagem de erro."""
+    caminho = LEDGER / f"{date.today().isoformat()}.jsonl"
+    por_comp, erros, total = {}, 0, 0.0
+    if not caminho.exists():
+        return por_comp, erros, total
+    for linha in caminho.read_text().splitlines():
+        try:
+            r = json.loads(linha)
+        except Exception:
+            continue
+        if r.get("error"):
+            erros += 1
+            continue
+        c = r.get("client") or "desconhecido"
+        d = por_comp.setdefault(c, {"usd": 0.0, "tin": 0, "tout": 0})
+        d["usd"] += r.get("cost_usd") or 0.0
+        d["tin"] += r.get("prompt_tokens") or 0
+        d["tout"] += r.get("completion_tokens") or 0
+        total += r.get("cost_usd") or 0.0
+    return por_comp, erros, total
+
+
+def claude_cota():
+    import re
+    import subprocess
+    try:
+        p = subprocess.run(
+            ["/home/reaper/.local/bin/ai-usagebar", "--vendor", "anthropic",
+             "--json", "--format", "{session_pct}|{weekly_pct}"],
+            capture_output=True, text=True, timeout=25)
+        return re.sub("<[^>]+>", "", json.loads(p.stdout)["text"]).split("|")
+    except Exception:
+        return None
+
+
+def despachos_hoje():
+    if not DESPACHOS.exists():
+        return 0, 0
+    vistos = {}
+    for linha in DESPACHOS.read_text().splitlines():
+        try:
+            r = json.loads(linha)
+        except Exception:
+            continue
+        vistos[r["id"]] = r
+    hoje = date.today().isoformat()
+    g = c = 0
+    for r in vistos.values():
+        ts = r.get("terminado_em") or r.get("iniciado_em") or 0
+        if date.fromtimestamp(ts).isoformat() != hoje:
+            continue
+        if r.get("nivel") == "gemini":
+            g += 1
+        elif r.get("nivel") == "claude":
+            c += 1
+    return g, c
+
+
+def brl(valor):
+    """Duas casas para leitura de relance; três só quando duas viram 0,00.
+
+    Quatro casas (US$ 0,0278) obrigam o olho a contar zero antes de entender a
+    ordem de grandeza — e numa notificação de celular o que importa é "é pouco
+    ou é muito", não o centavo exato.
+    """
+    if valor and valor < 0.01:
+        return f"{valor:.3f}".replace(".", ",")
+    return f"{valor:.2f}".replace(".", ",")
+
+
+def montar():
+    por_comp, erros, total = ledger_hoje()
+    teto = teto_deepseek()
+    cota = claude_cota()
+    g, c = despachos_hoje()
+
+    # Toda linha abaixo de ~32 caracteres, de propósito: no Telegram do celular
+    # linha maior quebra sozinha e separa número de unidade, que foi a queixa.
+    linhas = []
+    fracao = total / teto if teto else 0
+    icone = "💰" if fracao < 0.5 else ("⚠️" if fracao < 0.9 else "🔴")
+    teto_fmt = f"{teto:.2f}".replace(".", ",")
+
+    linhas.append(f"{icone} Custo de hoje")
+    linhas.append("")
+
+    if cota:
+        linhas.append(f"Claude {cota[0]}% 5h · {cota[1]}% semana")
+    linhas.append(f"DeepSeek US$ {brl(total)} de {teto_fmt}")
+
+    # O ai-memory sai sempre, mesmo com gasto baixo: é o único componente que
+    # gasta sozinho (o agendador revisa sessão nova em 14 escopos), e o dono
+    # pediu acompanhamento específico dele.
+    am = por_comp.get("ai-memory")
+    if am:
+        linhas.append(f"ai-memory US$ {brl(am['usd'])} · "
+                      f"{humano(am['tin'] + am['tout'])} tok")
+    if g or c:
+        linhas.append(f"Gemini {g} · Claude {c} despachos")
+
+    # Detalhe por componente só passando de metade do teto — ver o docstring.
+    if fracao >= 0.5 and len(por_comp) > 1:
+        linhas.append("")
+        for nome, d in sorted(por_comp.items(), key=lambda x: -x[1]["usd"]):
+            if nome == "ai-memory":
+                continue
+            linhas.append(f"{nome} US$ {brl(d['usd'])}")
+
+    if erros:
+        linhas.append("")
+        linhas.append(f"{erros} falha{'s' if erros > 1 else ''} no roteador hoje")
+
+    return "\n".join(linhas)
+
+
+def main():
+    texto = montar()
+    if "--dry-run" in sys.argv:
+        print(texto)
+        return 0
+    lib = carregar_lib()
+    # silent=False: custo é justamente o que ele quer ver chegar.
+    return 0 if lib.send_telegram(texto, silent=False) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

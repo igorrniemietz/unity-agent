@@ -1,0 +1,8 @@
+[Unit]
+Description=Alerta de gasto do ai-memory no Telegram
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/reaper/.local/bin/unity-alerta-ai-memory
+Environment=PATH=/home/reaper/.local/bin:/usr/local/bin:/usr/bin:/bin

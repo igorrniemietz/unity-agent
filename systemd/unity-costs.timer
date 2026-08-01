@@ -1,0 +1,15 @@
+[Unit]
+Description=Dispara a notificacao de custo, todo dia
+
+[Timer]
+# 21:40 todo dia, inclusive fim de semana: gasto de LLM nao respeita dia util,
+# e o digest (09:07/18:07) so roda de segunda a sexta. Horario escolhido para
+# pegar o dia praticamente inteiro e ainda dar tempo de reagir antes de dormir.
+OnCalendar=*-*-* 21:40:00
+# Se a maquina estava desligada na hora, manda ao ligar em vez de pular o dia.
+Persistent=true
+# Espalha ate 3 min para nao competir com outros timers no mesmo minuto.
+RandomizedDelaySec=180
+
+[Install]
+WantedBy=timers.target

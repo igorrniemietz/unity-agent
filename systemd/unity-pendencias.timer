@@ -1,0 +1,14 @@
+[Unit]
+Description=Verifica de tempos em tempos o que ficou em aberto
+
+[Timer]
+# A cada 30 min. O limite de "sessao parada" e 1h, entao meia hora e resolucao
+# suficiente para o dono saber no maximo 30 min depois de a sessao cruzar o
+# limite. Rodar de meia em meia hora NAO gera mensagem de meia em meia hora: o
+# unity-pendencias-telegram so fala quando entra item novo no conjunto.
+OnCalendar=*:0/30
+Persistent=false
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

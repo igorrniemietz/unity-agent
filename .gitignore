@@ -1,0 +1,8 @@
+# Nunca versionar segredo nem estado local
+.env
+*.env
+access.json
+projetos.md
+*.log
+despachos.jsonl
+__pycache__/

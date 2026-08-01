@@ -1,0 +1,7 @@
+[Unit]
+Description=Digest de andamento dos projetos no Telegram
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/reaper/.local/bin/unity-digest

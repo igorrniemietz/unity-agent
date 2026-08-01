@@ -1,0 +1,11 @@
+[Unit]
+Description=Unity — verifica a cada 2 min se o canal esta vivo
+
+[Timer]
+OnBootSec=45s
+OnUnitActiveSec=2min
+AccuracySec=15s
+Unit=unity-supervisor.service
+
+[Install]
+WantedBy=timers.target
