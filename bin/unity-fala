@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""Texto -> nota de voz em OGG/Opus, no formato que o Telegram toca.
+
+  unity-fala "Bom dia, chefe"     imprime no stdout o caminho do .ogg gerado
+  echo "texto" | unity-fala       idem, lendo o texto do stdin
+
+A fala vem do edge-tts (voz neural pt-BR do Microsoft Edge, grátis e já usada
+no resto da caixa para narração) e a conversão para OGG/Opus é do ffmpeg. O
+formato não é capricho: o Telegram só renderiza como nota de voz tocarável
+se o arquivo for OGG/Opus — em mp3 ele vira anexo genérico com play de mídia.
+
+O caminho impresso é de um arquivo temporário que fica no disco; quem chama
+depois sobe o arquivo para o Telegram e apaga. Só o caminho vai no stdout —
+erro, aviso e barra de progresso ficam no stderr.
+"""
+import asyncio
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+VOZ = os.environ.get("UNITY_VOZ", "pt-BR-FranciscaNeural")
+# Voz travada em pt-BR. A padrão era a pt-BR-ThalitaMultilingualNeural, mais
+# natural de ouvir, mas ela é Multilingual e detecta o idioma por frase: em
+# 25/09/2026 leu "combinado" com fonética inglesa e uma frase inteira em
+# espanhol. Troca por UNITY_VOZ=pt-BR-AntonioNeural (masculina) — ou de volta
+# para a Thalita, sabendo do risco.
+IDIOMA = os.environ.get("UNITY_VOZ_LANG", "pt-BR")
+# O edge-tts monta o envelope SSML com xml:lang fixo em en-US (mkssml, hardcoded
+# na lib). Corrigir isso ajuda, mas não resolveu a Thalita sozinho — a marcação
+# trecho a trecho (<lang>), que resolveria, é recusada pelo endpoint gratuito
+# do Edge com NoAudioReceived. Daí a troca de voz acima.
+BITRATE = "48k"    # mono 48k: nota de voz leve, o que o Telegram costuma mandar
+FFMPEG = "/usr/bin/ffmpeg"
+
+
+def texto_de_entrada():
+    if len(sys.argv) > 1:
+        return " ".join(sys.argv[1:]).strip()
+    if not sys.stdin.isatty():
+        return sys.stdin.read().strip()
+    return ""
+
+
+def fixar_idioma(edge_tts):
+    """Troca o xml:lang do envelope SSML do edge-tts de en-US para IDIOMA.
+
+    A lib não expõe parâmetro para isso — o idioma está escrito à mão dentro de
+    communicate.mkssml. Envolvemos a função original em vez de reescrever o
+    SSML, para não quebrar se a lib mudar o resto do envelope.
+    """
+    import edge_tts.communicate as com
+
+    if getattr(com.mkssml, "_unity_lang", None) == IDIOMA:
+        return
+
+    original = getattr(com.mkssml, "_unity_original", com.mkssml)
+
+    def mkssml(*args, **kwargs):
+        # Só o xml:lang do <speak>: o endpoint gratuito do Edge recusa o
+        # elemento <lang> (devolve NoAudioReceived), então não dá para marcar
+        # o idioma trecho a trecho como a documentação da Azure sugere.
+        return original(*args, **kwargs).replace(
+            "xml:lang='en-US'", f"xml:lang='{IDIOMA}'", 1
+        )
+
+    mkssml._unity_original = original
+    mkssml._unity_lang = IDIOMA
+    com.mkssml = mkssml
+
+
+def gerar_mp3(texto, destino):
+    import edge_tts
+    fixar_idioma(edge_tts)
+    asyncio.run(edge_tts.Communicate(texto, VOZ).save(destino))
+
+
+def mp3_para_ogg(entrada, saida):
+    # -ar 48000: Opus só aceita 48 kHz, o ffmpeg reamostra na hora.
+    proc = subprocess.run(
+        [FFMPEG, "-v", "error", "-y", "-i", entrada,
+         "-ac", "1", "-ar", "48000", "-c:a", "libopus", "-b:a", BITRATE,
+         saida],
+        capture_output=True, text=True)
+    if proc.returncode != 0 or not Path(saida).exists() or not Path(saida).stat().st_size:
+        print(f"ffmpeg falhou: {proc.stderr.strip()}", file=sys.stderr)
+        return False
+    return True
+
+
+def main():
+    texto = texto_de_entrada()
+    if not texto:
+        print('uso: unity-fala "<texto>"   (ou pipe o texto pelo stdin)',
+              file=sys.stderr)
+        return 2
+
+    fd, mp3 = tempfile.mkstemp(prefix="unity-fala-", suffix=".mp3")
+    os.close(fd)
+    fd, ogg = tempfile.mkstemp(prefix="unity-fala-", suffix=".ogg")
+    os.close(fd)
+
+    try:
+        gerar_mp3(texto, mp3)
+        if not mp3_para_ogg(mp3, ogg):
+            os.unlink(ogg)
+            return 1
+    except Exception as exc:
+        print(f"falha ao gerar a fala: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
+        try:
+            os.unlink(ogg)
+        except OSError:
+            pass
+        return 1
+    finally:
+        try:
+            os.unlink(mp3)
+        except OSError:
+            pass
+
+    print(ogg)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
