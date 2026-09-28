@@ -35,27 +35,26 @@ import sys
 import tempfile
 from pathlib import Path
 
-VOZ = os.environ.get("UNITY_VOZ", "pt-BR-FranciscaNeural")
-# Francisca é monolíngue pt-BR: a fonética dela não depende do que o texto
-# parece ser, então palavra portuguesa sai em português sempre.
+VOZ = os.environ.get("UNITY_VOZ", "pt-BR-ThalitaMultilingualNeural")
+# Thalita é a voz que o Igor prefere ouvir (25/09 e 28/09/2026).
 #
-# A padrão era a Thalita (Multilingual), que o Igor preferia ouvir em
-# 25/09/2026. Ela foi trocada em 28/09/2026 por erro reproduzido: "Rodapé
-# refeito" saiu falado como "Road Aperfito" — ela leu uma palavra portuguesa
-# com fonética inglesa, no meio de uma frase inteira em português. Medido com
-# round-trip TTS -> faster-whisper, três amostras da mesma frase:
+# Ela é Multilingual e escolhe a fonética POR FRASE, não por mensagem — daí o
+# defeito que ele reclamou em 28/09: numa mensagem de 190 caracteres, a
+# abertura curta "Rodapé refeito." saiu falada "Road Aperfito", em inglês, e só
+# ela; o resto do parágrafo saiu em português. A proteção que existia media o
+# texto INTEIRO, então nunca via esse caso.
 #
-#   Thalita   -> "Road Aperfito" / "Row Day Profito"
-#   Francisca -> "Roda pé refeito"          (certo)
-#   Antonio   -> "Roda a perra e feita"     (pior que as duas)
+# A correção não foi trocar de voz: foi tirar a frase curta do caminho dela
+# (ver `fundir_frases_curtas`). Medido por round-trip TTS -> faster-whisper,
+# mesma frase, mesma voz:
 #
-# Não é frase curta: o texto tinha 120 caracteres. Também não adianta abrir
-# com uma frase claramente portuguesa ("Olha só.") — a Thalita erra igual.
-# O que a segura de verdade seria marcar o idioma trecho a trecho no SSML, e
-# isso o endpoint gratuito recusa (ver IDIOMA abaixo).
+#   "Rodapé refeito. Tirei o Gemini..."  -> "Row Day Profito. Tirei o..."
+#   "Rodapé refeito, tirei o Gemini..."  -> "Roda a pé refeito, tirei o..."  ✓
 #
-# Para voltar à Thalita: UNITY_VOZ=pt-BR-ThalitaMultilingualNeural. A proteção
-# de frase curta abaixo continua valendo para ela.
+# Uma vírgula no lugar do ponto resolve, porque a frase passa a ter contexto
+# suficiente para ela decidir certo. UNITY_VOZ força outra voz:
+# pt-BR-FranciscaNeural (feminina, monolíngue) ou pt-BR-AntonioNeural
+# (masculina, e a pior das três neste teste).
 VOZ_CURTA = os.environ.get("UNITY_VOZ_CURTA", "pt-BR-FranciscaNeural")
 LIMITE_CURTO = int(os.environ.get("UNITY_VOZ_LIMITE_CURTO", "30"))
 # Abaixo de ~30 caracteres a Thalita não tem contexto suficiente e adota outro
@@ -143,6 +142,56 @@ _PRONUNCIA = tuple(
 )
 
 
+LIMITE_FRASE = int(os.environ.get("UNITY_VOZ_LIMITE_FRASE", "34"))
+# Abaixo disso uma frase não dá contexto para a voz Multilingual decidir o
+# idioma, e ela chuta — em inglês, quase sempre. 34 tem folga sobre o menor
+# caso que passou limpo nos testes (26 caracteres, 25/09/2026).
+
+_FIM_DE_FRASE = re.compile(r"(?<=[.!?])\s+")
+
+
+def fundir_frases_curtas(texto):
+    """Junta frase curta demais à vizinha, trocando o ponto por vírgula.
+
+    A voz Multilingual (Thalita) decide a fonética frase a frase. Frase curta
+    sem contexto vira inglês: "Rodapé refeito." saiu "Road Aperfito" em
+    28/09/2026, no meio de um parágrafo inteiro em português.
+
+    Só o PONTO vira vírgula. Interrogação e exclamação ficam de pé, porque a
+    entonação delas carrega sentido — "A que horas você chega?" virar
+    "A que horas você chega, a gente deixa a luz acesa." perde a pergunta.
+    Essas duas continuam expostas ao defeito, e é troca consciente.
+    """
+    frases = [f for f in _FIM_DE_FRASE.split(texto) if f.strip()]
+    if len(frases) < 2:
+        return texto                      # nada com que fundir
+
+    saida = []
+    for frase in frases:
+        frase = frase.strip()
+        anterior_funde = saida and saida[-1].endswith(",")
+        if anterior_funde:
+            saida[-1] = saida[-1] + " " + frase
+        else:
+            saida.append(frase)
+        # Curta e terminada em ponto: abre para a próxima entrar junto.
+        if len(saida[-1]) < LIMITE_FRASE and saida[-1].endswith("."):
+            saida[-1] = saida[-1][:-1] + ","
+
+    # A última pode ter ficado com a vírgula pendurada sem ninguém para receber:
+    # nesse caso ela volta a ser ponto e, se ainda for curta, cola na anterior.
+    if saida[-1].endswith(","):
+        saida[-1] = saida[-1][:-1] + "."
+        if len(saida) > 1 and len(saida[-1]) < LIMITE_FRASE:
+            cauda = saida.pop()
+            anterior = saida[-1]
+            if anterior.endswith((".", "!", "?")):
+                anterior = anterior[:-1]
+            saida[-1] = anterior + ", " + cauda[0].lower() + cauda[1:]
+
+    return " ".join(saida)
+
+
 def limpar_para_fala(texto):
     """Devolve o texto pronto para ser lido em voz alta.
 
@@ -170,7 +219,7 @@ def limpar_para_fala(texto):
     t = re.sub(r"(?:,\s*){2,}", ", ", t)
     t = re.sub(r"\.\s*(?=[.,])", "", t)
     t = re.sub(r"^[\s,.]+", "", t)
-    return t.strip()
+    return fundir_frases_curtas(t.strip())
 
 
 def escolher_voz(texto):
