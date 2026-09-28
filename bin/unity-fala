@@ -3,6 +3,7 @@
 
   unity-fala "Bom dia, chefe"     imprime no stdout o caminho do .ogg gerado
   echo "texto" | unity-fala       idem, lendo o texto do stdin
+  unity-fala --texto "..."        só imprime o texto já limpo, sem gerar áudio
 
 A fala vem do edge-tts (voz neural pt-BR do Microsoft Edge, grátis e já usada
 no resto da caixa para narração) e a conversão para OGG/Opus é do ffmpeg. O
@@ -12,32 +13,223 @@ se o arquivo for OGG/Opus — em mp3 ele vira anexo genérico com play de mídia
 O caminho impresso é de um arquivo temporário que fica no disco; quem chama
 depois sobe o arquivo para o Telegram e apaga. Só o caminho vai no stdout —
 erro, aviso e barra de progresso ficam no stderr.
+
+O texto passa por uma limpeza antes de virar fala (`limpar_para_fala`). Ela
+não é cosmética: a mensagem da Unity no Telegram é escrita para os olhos, e
+lida em voz alta ela sai errada de três jeitos medidos em 25/09/2026, com
+round-trip TTS -> faster-whisper:
+
+  - emoji vira nome de emoji falado. "✅ Corrigido" saiu como "Marca de
+    seleção branca corrigido"; o rodapé de consumo, que começa com 📊, saiu
+    como "Gráfico de barras Claude...". Isso acontece em qualquer voz.
+  - abreviação de tela ("5h", "7d", "201,1k tok", "US$ 0,028", "74%") sai
+    soletrada ou embolada.
+  - separador visual (·, |, —) não vira pausa.
 """
+import argparse
 import asyncio
 import os
+import re
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
-VOZ = os.environ.get("UNITY_VOZ", "pt-BR-ThalitaMultilingualNeural")
-# Voz neural de conversa, mais natural que a Francisca clássica; troca por
-# UNITY_VOZ=pt-BR-AntonioNeural (masculina) ou pt-BR-FranciscaNeural.
+VOZ = os.environ.get("UNITY_VOZ", "pt-BR-FranciscaNeural")
+# Francisca é monolíngue pt-BR: a fonética dela não depende do que o texto
+# parece ser, então palavra portuguesa sai em português sempre.
+#
+# A padrão era a Thalita (Multilingual), que o Igor preferia ouvir em
+# 25/09/2026. Ela foi trocada em 28/09/2026 por erro reproduzido: "Rodapé
+# refeito" saiu falado como "Road Aperfito" — ela leu uma palavra portuguesa
+# com fonética inglesa, no meio de uma frase inteira em português. Medido com
+# round-trip TTS -> faster-whisper, três amostras da mesma frase:
+#
+#   Thalita   -> "Road Aperfito" / "Row Day Profito"
+#   Francisca -> "Roda pé refeito"          (certo)
+#   Antonio   -> "Roda a perra e feita"     (pior que as duas)
+#
+# Não é frase curta: o texto tinha 120 caracteres. Também não adianta abrir
+# com uma frase claramente portuguesa ("Olha só.") — a Thalita erra igual.
+# O que a segura de verdade seria marcar o idioma trecho a trecho no SSML, e
+# isso o endpoint gratuito recusa (ver IDIOMA abaixo).
+#
+# Para voltar à Thalita: UNITY_VOZ=pt-BR-ThalitaMultilingualNeural. A proteção
+# de frase curta abaixo continua valendo para ela.
+VOZ_CURTA = os.environ.get("UNITY_VOZ_CURTA", "pt-BR-FranciscaNeural")
+LIMITE_CURTO = int(os.environ.get("UNITY_VOZ_LIMITE_CURTO", "30"))
+# Abaixo de ~30 caracteres a Thalita não tem contexto suficiente e adota outro
+# idioma: medido em 25/09/2026, "Combinado." saiu em inglês ("Combinato"),
+# "Feito." em inglês, "Corrigido e testado ok." em italiano. De 26 caracteres
+# para cima, todas as amostras saíram em pt com p >= 0,94. Nessa faixa curta
+# usamos a Francisca, que é monolíngue e nunca troca — dois segundos de voz
+# diferente valem mais que uma frase com sotaque errado.
+
+IDIOMA = os.environ.get("UNITY_VOZ_LANG", "pt-BR")
+# O edge-tts monta o envelope SSML com xml:lang fixo em en-US (mkssml, escrito
+# à mão na lib). Corrigir isso ajuda mas não basta sozinho — a marcação trecho
+# a trecho (<lang>), que resolveria, é recusada pelo endpoint gratuito do Edge
+# com NoAudioReceived (testado nas duas formas em 25/09/2026).
+
 BITRATE = "48k"    # mono 48k: nota de voz leve, o que o Telegram costuma mandar
 FFMPEG = "/usr/bin/ffmpeg"
 
 
-def texto_de_entrada():
-    if len(sys.argv) > 1:
-        return " ".join(sys.argv[1:]).strip()
+# --------------------------------------------------------------------------- #
+# Limpeza do texto
+# --------------------------------------------------------------------------- #
+
+_EMOJI = re.compile(
+    "["
+    "\U0001F000-\U0001FAFF"   # pictogramas, emoticons, símbolos suplementares
+    "\U00002600-\U000027BF"   # símbolos diversos + dingbats (✅ ⚠ ⏳ ✔)
+    "\U00002B00-\U00002BFF"   # setas e formas
+    "\U00002190-\U000021FF"   # setas
+    "\U0001F1E6-\U0001F1FF"   # bandeiras
+    "\U0000FE00-\U0000FE0F"   # seletores de variação
+    "\U0000200D"              # zero-width joiner
+    "\U00002122\U00002139\U0000303D\U00003030"
+    "]+"
+)
+
+_SUBS = (
+    # dinheiro e porcentagem antes das unidades soltas, para "US$ 0,028" não
+    # virar "US cifrão zero"
+    (re.compile(r"\bUS\$\s*([\d.,]+)"), r"\1 dólares"),
+    (re.compile(r"\bR\$\s*([\d.,]+)"), r"\1 reais"),
+    (re.compile(r"([\d][\d.,]*)\s*%"), r"\1 por cento"),
+    # abreviações de tela do rodapé de consumo e das mensagens de status
+    (re.compile(r"\b([\d.,]+)\s*k\s*tok\b", re.I), r"\1 mil tokens"),
+    (re.compile(r"\btok\b", re.I), "tokens"),
+    (re.compile(r"\b(\d+)\s*h\b"), r"\1 horas"),
+    (re.compile(r"\b(\d+)\s*d\b"), r"\1 dias"),
+    (re.compile(r"\b(\d+)\s*min\b"), r"\1 minutos"),
+    (re.compile(r"\b(\d+)\s*s\b"), r"\1 segundos"),
+)
+
+_URL = re.compile(r"https?://\S+")
+_CAMINHO = re.compile(r"(?<![\w~])~?/(?:[\w.\-]+/)+[\w.\-]*")
+_SEPARADOR = re.compile(r"[·•|—–~`#*_>]+")
+# Nome composto por hífen ("unity-delegar", "lemitz-kanban") é lido como uma
+# palavra estrangeira só e sai embolado — "unity-delegar" virou "Íunite
+# Delegar" no round-trip de 25/09/2026. Com espaço, cada metade é pronunciada
+# inteira. Só troca quando os dois lados têm duas letras ou mais, para não
+# estragar "e-mail".
+_HIFEN_COMPOSTO = re.compile(r"(?<=[^\W\d_]{2})-(?=[^\W\d_]{2})")
+
+# Nome próprio estrangeiro escrito do jeito certo é lido pela voz pt-BR com a
+# fonética portuguesa da grafia: "Claude" vira "cláu-de", "cache" vira "cá-che".
+# Aqui ele é reescrito do jeito que se PRONUNCIA, e só na cópia falada — o que
+# o Igor lê na tela continua escrito certo. Cada linha foi conferida por
+# round-trip (TTS -> faster-whisper) em 28/09/2026: o whisper devolveu o nome
+# na grafia original, sinal de que o som saiu certo.
+_PRONUNCIA = tuple(
+    (re.compile(rf"\b{alvo}\b", re.I), fala)
+    for alvo, fala in (
+        ("Claude",      "Clôd"),
+        ("DeepSeek",    "dípsiqui"),
+        ("opencode",    "ôupen coud"),
+        ("OpenRouter",  "ôupen rauter"),
+        ("Antigravity", "antigráviti"),
+        ("Gemini",      "Jêmini"),
+        ("Vercel",      "Versél"),
+        ("WhatsApp",    "uótsapp"),
+        ("LinkedIn",    "Línkedin"),
+        ("deploy",      "deplói"),
+        ("commit",      "cômit"),
+        ("cache",       "quéche"),
+        ("Nex",         "Necs"),
+    )
+)
+
+
+def limpar_para_fala(texto):
+    """Devolve o texto pronto para ser lido em voz alta.
+
+    Tira o que é visual (emoji, separador, caminho de arquivo, link) e escreve
+    por extenso o que é abreviação de tela. Nada aqui muda o sentido — só a
+    forma, porque o ouvido não lê símbolo.
+    """
+    t = _EMOJI.sub(" ", texto)
+    # Caminho e URL viram a parte que se diz em voz alta: o nome do arquivo e o
+    # domínio. Soletrar "barra home barra reaper barra projetos" não ajuda
+    # ninguém, e trocar por um rótulo fixo deixa a frase torta ("o log tá em o
+    # caminho do arquivo").
+    t = _URL.sub(lambda m: " " + m.group(0).split("//", 1)[-1].split("/", 1)[0] + " ", t)
+    t = _CAMINHO.sub(
+        lambda m: " " + (m.group(0).rstrip("/").rsplit("/", 1)[-1] or "essa pasta") + " ", t)
+    for padrao, troca in _SUBS:
+        t = padrao.sub(troca, t)
+    for padrao, troca in _PRONUNCIA:
+        t = padrao.sub(troca, t)
+    t = _SEPARADOR.sub(", ", t)
+    t = _HIFEN_COMPOSTO.sub(" ", t)
+    t = re.sub(r"\s*\n+\s*", ". ", t)     # quebra de linha vira pausa de frase
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r"\s+([,.!?])", r"\1", t)  # não deixa espaço antes de pontuação
+    t = re.sub(r"(?:,\s*){2,}", ", ", t)
+    t = re.sub(r"\.\s*(?=[.,])", "", t)
+    t = re.sub(r"^[\s,.]+", "", t)
+    return t.strip()
+
+
+def escolher_voz(texto):
+    """A voz padrão, trocando por VOZ_CURTA só quando a escolhida é Multilingual.
+
+    Voz Multilingual decide a fonética lendo o texto, e em frase curta decide
+    errado (ver LIMITE_CURTO). Voz monolíngue não tem esse problema, então a
+    troca só faz sentido para a primeira — inclusive quando o Igor pede a
+    Thalita de volta por UNITY_VOZ.
+    """
+    voz = os.environ.get("UNITY_VOZ") or VOZ
+    if "Multilingual" in voz and len(texto) < LIMITE_CURTO:
+        return VOZ_CURTA
+    return voz
+
+
+# --------------------------------------------------------------------------- #
+# Geração
+# --------------------------------------------------------------------------- #
+
+def texto_de_entrada(argv):
+    if argv:
+        return " ".join(argv).strip()
     if not sys.stdin.isatty():
         return sys.stdin.read().strip()
     return ""
 
 
-def gerar_mp3(texto, destino):
+def fixar_idioma(edge_tts):
+    """Troca o xml:lang do envelope SSML do edge-tts de en-US para IDIOMA.
+
+    A lib não expõe parâmetro para isso — o idioma está escrito à mão dentro de
+    communicate.mkssml. Envolvemos a função original em vez de reescrever o
+    SSML, para não quebrar se a lib mudar o resto do envelope.
+    """
+    import edge_tts.communicate as com
+
+    if getattr(com.mkssml, "_unity_lang", None) == IDIOMA:
+        return
+
+    original = getattr(com.mkssml, "_unity_original", com.mkssml)
+
+    def mkssml(*args, **kwargs):
+        # Só o xml:lang do <speak>: o endpoint gratuito do Edge recusa o
+        # elemento <lang> (devolve NoAudioReceived), então não dá para marcar
+        # o idioma trecho a trecho como a documentação da Azure sugere.
+        return original(*args, **kwargs).replace(
+            "xml:lang='en-US'", f"xml:lang='{IDIOMA}'", 1
+        )
+
+    mkssml._unity_original = original
+    mkssml._unity_lang = IDIOMA
+    com.mkssml = mkssml
+
+
+def gerar_mp3(texto, voz, destino):
     import edge_tts
-    asyncio.run(edge_tts.Communicate(texto, VOZ).save(destino))
+    fixar_idioma(edge_tts)
+    asyncio.run(edge_tts.Communicate(texto, voz).save(destino))
 
 
 def mp3_para_ogg(entrada, saida):
@@ -54,11 +246,41 @@ def mp3_para_ogg(entrada, saida):
 
 
 def main():
-    texto = texto_de_entrada()
-    if not texto:
+    # As flags só valem na primeira posição: o texto a falar vem cru da
+    # mensagem do Telegram e pode começar por hífen ou travessão, que o
+    # argparse leria como opção.
+    argv = sys.argv[1:]
+    flags = {"--texto", "-v", "--info", "-h", "--help"}
+    if argv and argv[0] in flags:
+        ap = argparse.ArgumentParser(description="Texto -> nota de voz OGG/Opus.")
+        ap.add_argument("--texto", action="store_true",
+                        help="imprime só o texto limpo, sem gerar áudio")
+        ap.add_argument("-v", "--info", action="store_true",
+                        help="diagnóstico (voz escolhida, texto limpo) no stderr")
+        ap.add_argument("palavras", nargs="*")
+        args = ap.parse_args(argv)
+    else:
+        args = argparse.Namespace(texto=False, info=False, palavras=argv)
+
+    bruto = texto_de_entrada(args.palavras)
+    if not bruto:
         print('uso: unity-fala "<texto>"   (ou pipe o texto pelo stdin)',
               file=sys.stderr)
         return 2
+
+    texto = limpar_para_fala(bruto)
+    if not texto:
+        print("nada para falar depois de limpar o texto", file=sys.stderr)
+        return 2
+
+    if args.texto:
+        print(texto)
+        return 0
+
+    voz = escolher_voz(texto)
+    if args.info:
+        print(f"voz={voz} ({len(texto)} caracteres)", file=sys.stderr)
+        print(f"texto={texto!r}", file=sys.stderr)
 
     fd, mp3 = tempfile.mkstemp(prefix="unity-fala-", suffix=".mp3")
     os.close(fd)
@@ -66,7 +288,7 @@ def main():
     os.close(fd)
 
     try:
-        gerar_mp3(texto, mp3)
+        gerar_mp3(texto, voz, mp3)
         if not mp3_para_ogg(mp3, ogg):
             os.unlink(ogg)
             return 1
