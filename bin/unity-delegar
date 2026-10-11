@@ -32,9 +32,11 @@ As cinco faixas, da mais cara para a mais barata:
 - `opencode` — o modelo grátis do opencode zen (hoje MiMo v2.6 Flash; era
                DeepSeek v4 Flash até 24/08/2026, quando saiu do catálogo), fora
                da cota da Anthropic.
-- `nex`      — Nex N2.5 Pro pela OpenRouter, também grátis, pelo mesmo binário
-               do opencode. Mais lento que o MiMo (raciocina mais), e melhor no
-               que é aberto. Criado em 28/09/2026.
+- `nex`      — a faixa grátis da OpenRouter, pelo mesmo binário do opencode.
+               Mais lenta que o MiMo (raciocina mais), e melhor no que é
+               aberto. Criada em 28/09/2026 com o Nex N2.5 Pro, que dá o nome
+               ao flag; hoje o padrão é o Laguna S 2.1, porque a variante
+               `:free` do Nex saiu do catálogo em 11/10/2026.
 
 As duas últimas são as faixas GRÁTIS, e são o destino padrão de tudo que é
 simples, repetitivo ou volumoso — o que gastaria cota cara sem exigir critério.
@@ -102,8 +104,20 @@ MODELO_OPENCODE = os.environ.get("UNITY_OPENCODE_MODEL",
 # que a delegação barata inteira parava. Agora uma cobre a outra. E o revisor
 # cruzado (`revisar_entrega`) precisa de dois modelos diferentes para existir:
 # modelo revisando a si mesmo aprova o próprio erro.
+#
+# E a rotação pegou ESTA faixa também. Medido em 11/10/2026: o padrão era
+# `nex-agi/nex-n2.5-pro:free`, e a variante gratuita tinha saído do catálogo da
+# OpenRouter — o modelo pago de mesmo nome continuava lá (US$ 0,075 por milhão
+# de entrada), então o nome "existia" e a faixa grátis não. Quem instalasse
+# herdava uma faixa que falha sem dizer por quê.
+#
+# O padrão agora é o Laguna S 2.1 da Poolside: agente de código, 118B com 8B
+# ativos, 70,2% no Terminal-Bench 2.1, 262k de contexto, `:free` hoje. O nome
+# da faixa segue `nex` porque trocar o flag quebraria o hábito de quem já usa —
+# leia como "a faixa grátis da OpenRouter". Para conferir o catálogo antes de
+# culpar o provedor, veja MODELOS.md.
 MODELO_NEX = os.environ.get("UNITY_NEX_MODEL",
-                            "openrouter/nex-agi/nex-n2.5-pro:free")
+                            "openrouter/poolside/laguna-s-2.1:free")
 
 # Onde a chave da OpenRouter pode estar. O despachante LÊ, mas nunca imprime:
 # a Unity não é o lugar onde chave de API mora, e o hook que bloqueia acesso a

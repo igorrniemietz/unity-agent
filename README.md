@@ -55,6 +55,11 @@ mudo. Quem faz é um executor, escolhido por `unity-delegar --nivel`:
 As duas primeiras não consomem cota nenhuma. As duas últimas consomem a mesma
 cota que mantém a Unity viva, então são exceção, não hábito.
 
+**[MODELOS.md](MODELOS.md)** tem o resto: quais modelos estão de graça hoje,
+como listar o catálogo (ele **rotaciona sem aviso**, e modelo que sai não
+volta), como trocar o modelo de cada faixa por variável de ambiente, e o que
+"grátis" custa em velocidade, limite de uso e privacidade dos dados.
+
 Quando uma faixa grátis termina, **o outro modelo grátis revisa** o que foi
 feito e carimba `APROVADO`, `RESSALVAS` ou `PROBLEMAS` no aviso. Revisar custa
 zero quando o revisor também é grátis, e "terminou" nunca significou "ficou
@@ -241,3 +246,14 @@ ambiente ou do arquivo de ambiente do canal, nunca embutido.
 Também não traz ferramenta pessoal: o que era específico de um dono (radar de
 vagas, painel de cliente, controle de gasto doméstico) ficou fora. O que está
 aqui é a camada que serve a qualquer um.
+
+## Licença
+
+[MIT](LICENSE). Em português claro: **qualquer pessoa já está autorizada** a
+usar, copiar, modificar, distribuir e até vender isto, de graça, sem pedir
+permissão a ninguém. Não há chave, cadastro nem licença por pessoa — o arquivo
+`LICENSE` no repositório **é** a permissão, e ela vale para todo mundo que
+receber uma cópia.
+
+A única obrigação de quem usa é manter o aviso de copyright junto. E a única
+coisa que a licença nega é garantia: se quebrar, o problema é de quem rodou.
