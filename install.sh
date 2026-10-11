@@ -58,16 +58,22 @@ if [ ! -f "$HOME/.claude/channels/telegram/access.json" ]; then
 fi
 
 # O caminho do `claude` é fixo na unit do daemon porque o systemd não herda o
-# PATH do shell. Descobrir aqui evita a unit apontar para um nó que não existe.
+# PATH do shell. A unit vem do repo com placeholder, e não com um caminho real:
+# um caminho de outra máquina sobrevive à reescrita de $HOME e vira unit que
+# falha apontando para um nó que nunca existiu aqui.
 CLAUDE_BIN="$(command -v claude || true)"
 if [ -n "$CLAUDE_BIN" ]; then
-  sed -i "s|ExecStart=.*claude daemon run|ExecStart=$CLAUDE_BIN daemon run|" \
-      "$UNITS/unity-daemon.service"
-  sed -i "s|^Environment=PATH=.*|Environment=PATH=$(dirname "$CLAUDE_BIN"):$BIN:/usr/bin:/bin|" \
+  sed -i -e "s|__CLAUDE_BIN__|$CLAUDE_BIN|" \
+         -e "s|__CLAUDE_DIR__|$(dirname "$CLAUDE_BIN")|" \
+         -e "s|__UNITY_BIN__|$BIN|" \
       "$UNITS/unity-daemon.service"
   echo "→ daemon apontado para $CLAUDE_BIN"
 else
-  echo "  AVISO: 'claude' não está no PATH — ajuste unity-daemon.service à mão"
+  echo
+  echo "  ATENÇÃO: 'claude' não está no PATH."
+  echo "  A unit do daemon ficou com placeholder e NÃO vai subir."
+  echo "  Instale o Claude Code e rode ./install.sh de novo — é idempotente."
+  echo
 fi
 
 systemctl --user daemon-reload

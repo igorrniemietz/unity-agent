@@ -130,6 +130,30 @@ def checagens():
               "presente" if tem_conteudo(HOME / ".claude/supervisor-settings.json", 200) else "ausente",
               "rode ./install.sh — ele copia de config/unity-settings.json"))
 
+    # A unit vem do repo com placeholder no ExecStart. Se o `claude` não estava
+    # no PATH na hora do install, o placeholder fica — e o sintoma é uma unit
+    # que falha ao subir com "No such file or directory", que ninguém liga ao
+    # instalador. Melhor dizer aqui.
+    unit_daemon = UNITS / "unity-daemon.service"
+    aponta = ""
+    if unit_daemon.is_file():
+        for linha in unit_daemon.read_text().splitlines():
+            if linha.startswith("ExecStart="):
+                aponta = linha.split("=", 1)[1].split()[0]
+                break
+    if "__CLAUDE_BIN__" in aponta:
+        estado_exec, det_exec = "falta", "unit ainda com placeholder"
+    elif aponta and not Path(aponta).exists():
+        estado_exec, det_exec = "falta", f"aponta para {aponta}, que não existe"
+    elif aponta:
+        estado_exec, det_exec = "ok", aponta
+    else:
+        estado_exec, det_exec = "falta", "unit ausente"
+    c.append(("nucleo", "unit do daemon aponta para um `claude` real",
+              estado_exec, det_exec,
+              "instale o Claude Code e rode ./install.sh de novo — ele é "
+              "idempotente e preenche o caminho sozinho"))
+
     c.append(("nucleo", "daemon de pé (unity-daemon.service)",
               "ok" if unit_ativa("unity-daemon.service") else "falta",
               "ativo" if unit_ativa("unity-daemon.service") else "parado",

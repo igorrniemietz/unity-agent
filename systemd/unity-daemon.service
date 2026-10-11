@@ -8,10 +8,10 @@ Type=simple
 # manter o daemon vivo: o `service install` proprio esta desabilitado nesta
 # versao, e sem isso o daemon sai quando o ultimo cliente desconecta, levando
 # junto o agente do Telegram.
-ExecStart=/home/reaper/.nvm/versions/node/v24.18.0/bin/claude daemon run
+ExecStart=__CLAUDE_BIN__ daemon run
 Restart=always
 RestartSec=5
-Environment=PATH=/home/reaper/.nvm/versions/node/v24.18.0/bin:/home/reaper/.local/bin:/usr/bin:/bin
+Environment=PATH=__CLAUDE_DIR__:__UNITY_BIN__:/usr/bin:/bin
 
 [Install]
 WantedBy=default.target
