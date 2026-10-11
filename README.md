@@ -15,8 +15,8 @@ cai.
 Telegram  ──►  plugin telegram (bun server.ts)
                       │  stdio MCP
                       ▼
-              sessão de fundo do Claude Code  ── unity-despachar ──►  executor
-                      ▲                                              (claude / gemini)
+              sessão de fundo do Claude Code  ── unity-delegar ──►  executor
+                      ▲                                            (opencode / nex / sonnet)
                       │  spawn
               unity-daemon.service  ◄── unity-supervisor.timer (2 min) ── unity-ensure
 ```
@@ -39,6 +39,34 @@ Este repo é a camada que falta: durabilidade, vigilância e uma persona.
 | Vigia | `systemd/unity-supervisor.timer` + `bin/unity-ensure` | A cada 2 min confere se existe UMA sessão de fundo com UM servidor de canal. Recria se não. |
 | Persona | `prompts/*.md` | Como ela fala e como ela decide. Injetado por `--append-system-prompt` no lançamento. |
 | Despacho | `bin/unity-despachar` | Manda o trabalho longo para um executor, para o canal não ficar mudo. |
+
+## As faixas de execução
+
+Trabalho longo não é feito na sessão dela — enquanto ela trabalha, o canal fica
+mudo. Quem faz é um executor, escolhido por `unity-delegar --nivel`:
+
+| Faixa | Quem é | Quando |
+|---|---|---|
+| `opencode` | modelo grátis do opencode zen | **padrão.** Tarefa volumosa e já decidida: varrer arquivos aplicando a mesma mudança, escrever teste, traduzir, reformatar, montar página a partir de um modelo |
+| `nex` | modelo grátis pela OpenRouter | também custo zero, mais lento porque raciocina mais. Melhor quando a tarefa tem mais de um jeito razoável de ser feita |
+| `sonnet` | Claude Sonnet | reserva. Bug de causa desconhecida, decisão de arquitetura, qualquer coisa cujo erro seja caro de desfazer |
+| `claude` | Claude Opus | a faixa mais cara. Não é a reserva barata — o nome engana |
+
+As duas primeiras não consomem cota nenhuma. As duas últimas consomem a mesma
+cota que mantém a Unity viva, então são exceção, não hábito.
+
+Quando uma faixa grátis termina, **o outro modelo grátis revisa** o que foi
+feito e carimba `APROVADO`, `RESSALVAS` ou `PROBLEMAS` no aviso. Revisar custa
+zero quando o revisor também é grátis, e "terminou" nunca significou "ficou
+bom".
+
+Duas travas aprendidas no caminho: `opencode` e `nex` rodam pelo mesmo binário
+e pelo mesmo banco de estado, então **duas delegações simultâneas entre elas**
+voltam com "database is locked" — o despachante serializa. E `ok: false` de uma
+delegação **não prova que o trabalho falhou**: já aconteceu um site inteiro
+funcionando voltar marcado como falha porque o executor deixou um servidor de
+teste em primeiro plano e estourou o relógio do shell. Abra e olhe antes de
+descartar.
 
 ## Decisões que custaram caro (não repita)
 
