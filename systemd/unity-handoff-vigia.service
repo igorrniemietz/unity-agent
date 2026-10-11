@@ -1,0 +1,10 @@
+[Unit]
+Description=Unity — handoff no ai-memory de sessão de fundo parada há 1h30
+
+[Service]
+Type=oneshot
+# cd para $HOME pela mesma razão do unity-ensure: unit sem WorkingDirectory
+# herda o cwd de quem lançou, e isso já mandou transcript para ~/.claude/projects/-tmp/.
+WorkingDirectory=/home/reaper
+Environment=PATH=/home/reaper/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/reaper/.local/bin/unity-handoff-vigia

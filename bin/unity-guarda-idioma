@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""Hook PreToolUse do `reply`: barra idioma errado E cola o rodapé de custo.
+
+As duas coisas num script só, de propósito. Antes eram dois hooks no mesmo
+matcher (`unity-guarda-idioma` + `unity-rodape-custo`) e, medido em 20/08/2026,
+**o segundo nunca era honrado**: 0 de 4 respostas reais saíram com rodapé,
+apesar de o script funcionar sozinho e estar registrado. A Unity chegou a
+escrever "o consumo de hoje é isso aí embaixo" apontando para um rodapé que não
+existia. Um hook por ferramenta elimina a classe inteira do problema.
+
+Parte 1 — idioma: barra resposta que não está em português.
+
+Em 19/08/2026 a Unity respondeu ao dono em japonês. A persona já mandava
+escrever em português — instrução, portanto ignorável. Esta é a trava de
+FERRAMENTA: roda entre a decisão dela e a saída de rede, e não tem prompt que
+a convença. Ver a memória feedback_trava_de_ferramenta_nao_de_prompt.
+
+Só olha `mcp__plugin_telegram_telegram__reply`. Bloquear devolve o motivo para
+a própria Unity, que reescreve e chama de novo — o dono não vê nada disso.
+"""
+import importlib.util
+import json
+import subprocess
+import sys
+
+FERRAMENTA = "mcp__plugin_telegram_telegram__reply"
+LIB = "/home/reaper/.local/bin/unity-lib.py"
+
+
+# ─── Parte 2: rodapé de custo ───────────────────────────────────────────────
+MARCA_RODAPE = "📊 Claude"
+
+
+def colar_rodape(evento, texto):
+    """Anexa a linha de consumo ao texto da resposta e devolve `updatedInput`.
+
+    Existe para o rodapé voltar a sair em TODA mensagem sem custar uma ida e
+    volta do modelo: quando ela mesma rodava `unity-uso`, "oi" levava 16,3 s
+    contra 4,0 s respondendo direto. Aqui são ~100 ms de subprocesso, fora da
+    sessão.
+
+    Não trunca: a Bot API corta em 4096 e o plugin do Telegram já divide
+    mensagem longa preferindo quebra de linha, então o rodapé cai no fim do
+    último pedaço. Cortar a resposta dela para caber o rodapé seria trocar
+    conteúdo por enfeite.
+    """
+    if MARCA_RODAPE in texto:
+        return                      # ela já colou; não duplica
+
+    # dono 02/09/2026: quando ele pede "status das finanças", a resposta é só o
+    # bloco de status (saída do status_financeiro.py), pra ele copiar e colar
+    # em outro lugar sem o rodapé de consumo. O bloco sempre começa com uma
+    # destas linhas — nesse caso, não anexa o rodapé.
+    if texto.lstrip().startswith(("SUPERAVIT EM ", "DEFICIT EM ", "SEM MOVIMENTO EM ")):
+        return
+    try:
+        r = subprocess.run(["/home/reaper/.local/bin/unity-uso", "--linha"],
+                           capture_output=True, text=True, timeout=8)
+        pe = r.stdout.strip() if r.returncode == 0 else ""
+    except Exception:
+        pe = ""
+    if not pe:
+        return                      # rodapé faltando é aceitável; inventado não
+
+    nova = dict(evento.get("tool_input") or {})
+    nova["text"] = texto.rstrip() + "\n\n" + pe
+    print(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "updatedInput": nova,
+        }
+    }))
+
+
+def liberar():
+    sys.exit(0)
+
+
+def main():
+    try:
+        evento = json.load(sys.stdin)
+    except Exception:
+        liberar()   # hook que quebra não pode virar mordaça
+
+    if evento.get("tool_name") != FERRAMENTA:
+        liberar()
+
+    texto = (evento.get("tool_input") or {}).get("text") or ""
+    if not texto:
+        liberar()
+
+    try:
+        spec = importlib.util.spec_from_file_location("unity_lib", LIB)
+        lib = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(lib)
+    except Exception:
+        liberar()
+
+    trecho = lib.idioma_suspeito(texto)
+    if not trecho:
+        # Português OK: segue para a parte 2, o rodapé.
+        colar_rodape(evento, texto)
+        liberar()
+
+    lib._registrar_idioma(texto, trecho)
+    print(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": (
+                "Bloqueado pela trava de idioma: a resposta tem escrita "
+                "nao-latina (trecho: " + trecho[:60] + "). O dono le em "
+                "portugues do Brasil. Reescreva a MESMA resposta em portugues, "
+                "texto puro, e chame reply de novo."
+            ),
+        }
+    }))
+    sys.exit(0)
+
+
+main()

@@ -1,0 +1,13 @@
+[Unit]
+Description=Verifica virada da janela de 5h do Claude a cada 10 minutos
+
+[Timer]
+# Roda a cada 10 minutos para detectar quando session_pct cai (virada de janela).
+OnCalendar=*:0/10
+# Se a maquina estava desligada na hora, roda ao ligar em vez de perder o ciclo.
+Persistent=true
+# Espalha ate 30s para nao competir no mesmo segundo exato com outros timers.
+RandomizedDelaySec=30
+
+[Install]
+WantedBy=timers.target

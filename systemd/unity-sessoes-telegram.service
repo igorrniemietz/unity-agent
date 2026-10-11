@@ -1,0 +1,11 @@
+[Unit]
+Description=Aviso periodico de sessoes ativas no Telegram
+# Sem rede, o send_telegram falha em silencio e o ciclo fica sem aviso.
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/reaper/.local/bin/unity-sessoes-telegram
+# unity-sessoes e unity-lib vivem em ~/.local/bin, fora do PATH padrao de um
+# servico do systemd (ele nao le o perfil do shell).
+Environment=PATH=/home/reaper/.local/bin:/usr/local/bin:/usr/bin:/bin

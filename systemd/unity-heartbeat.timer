@@ -1,0 +1,15 @@
+[Unit]
+Description=Unity — a cada 2 min, checa; avisa de 5 em 5 min se houver trabalho
+
+[Timer]
+# 2 min, e nao 5. O aviso continua saindo de 5 em 5 min (o espacamento e
+# decidido no script), mas com o timer em 5 min o PRIMEIRO aviso podia demorar
+# ate 10 min: o limite de 5 min so era conferido quando o timer calhava de
+# rodar. Granularidade fina no timer, espacamento no codigo.
+OnBootSec=2min
+OnUnitActiveSec=2min
+AccuracySec=15s
+Unit=unity-heartbeat.service
+
+[Install]
+WantedBy=timers.target

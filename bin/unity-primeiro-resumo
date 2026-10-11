@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""Hook PreToolUse: nao deixa ela sumir no trabalho sem dizer o que entendeu.
+
+A QUEIXA E O NUMERO
+
+dono, 10/09/2026: "quando pergunto algo pra ela, demora muito para eu ter uma
+resposta; tenta pelo menos que ela passe um resumo do que ela vai executar para
+eu ter nocao se ela entendeu o que eu disse".
+
+Medido nas 249 mensagens dele com resposta, do transcript:
+
+    resposta em ate 60s   -> 125 casos (50%),  mediana de  1 ferramenta antes de falar
+    resposta acima de 2min ->  73 casos (29%),  mediana de 12 ferramentas antes de falar
+
+Ou seja: a demora NAO e o modelo pensando (o raciocinio dela sempre foi ~2,7s,
+ver memoria project_unity_latencia_idas_e_voltas). E que ela faz o trabalho
+INTEIRO antes de dizer a primeira palavra. Do lado dele, "Manda bala" as 11:50
+virou 505 segundos de silencio com 66 ferramentas rodando que ele nao via.
+
+POR QUE TRAVA E NAO INSTRUCAO
+
+A persona ja pede resposta rapida ha semanas. Instrucao o modelo pula -- foi
+exatamente assim com o `reply`, que ela ignorou o dia inteiro em 04/08 apesar do
+aviso em letras garrafais (memoria project_unity_reply_tool_nunca_chamado), e
+com a proibicao do Sonnet em 24/08 (feedback_trava_de_ferramenta_nao_de_prompt).
+O que funciona e o turno nao andar sem o passo.
+
+O CORTE
+
+Bloqueia na 4a ferramenta, ou depois de 45s, o que vier primeiro. Com corte em 3
+ferramentas: pega 88% das respostas lentas e mexe em so 16 das 125 rapidas -- que
+sao rapidas de qualquer jeito, entao o resumo nao atrasa nada, so antecipa.
+
+Falha ABERTO: qualquer erro aqui devolve exit 0 e o turno segue. Um resumo
+perdido custa uma duvida; um hook quebrado custa o agente inteiro.
+"""
+import json
+import os
+import re
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+REPLY = "mcp__plugin_telegram_telegram__reply"
+CANAL = 'source="plugin:telegram'
+ESTADO = Path.home() / ".local/share/unity-supervisor/primeiro-resumo.json"
+
+LIMITE_FERRAMENTAS = int(os.environ.get("UNITY_RESUMO_FERRAMENTAS", "3"))
+LIMITE_SEGUNDOS = int(os.environ.get("UNITY_RESUMO_SEGUNDOS", "45"))
+
+# Ferramentas que NUNCA podem ser barradas, sob pena de deadlock:
+# o proprio reply, e o ToolSearch que carrega o reply (ele e deferred --
+# sem ToolSearch ela nao TEM como chamar o reply, e barrar aqui seria
+# exigir um passo e trancar a porta dele ao mesmo tempo).
+LIVRES = {REPLY, "ToolSearch", "mcp__plugin_telegram_telegram__react",
+          "TodoWrite", "EnterPlanMode", "ExitPlanMode"}
+
+# Teto de insistencia, pela licao do unity-exige-resposta v1: se ela por
+# qualquer motivo NAO CONSEGUE chamar o reply (canal caido, ferramenta fora
+# da allow), insistir para sempre troca "muda" por "travada", que e pior.
+MAX_INSISTENCIA = 2
+
+
+def libera():
+    sys.exit(0)
+
+
+def nega(motivo):
+    print(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": motivo,
+        }
+    }))
+    sys.exit(0)
+
+
+def _quando(ts):
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0.0
+
+
+def turno_atual(caminho):
+    """(quando_chegou, texto, ferramentas_usadas, ja_respondeu) do turno em curso.
+
+    "Turno" aqui e o trecho depois da ULTIMA mensagem que entrou pelo Telegram.
+    Se nao houver nenhuma, nao e turno de canal e este hook nao tem o que fazer.
+    """
+    chegou, pedido, ferramentas, respondeu = 0.0, "", 0, False
+    try:
+        linhas = Path(caminho).read_text(errors="replace").splitlines()
+    except Exception:
+        return None
+    # De TRAS PARA FRENTE, parando na primeira mensagem de canal encontrada.
+    # Este hook roda antes de CADA ferramenta; varrer o transcript inteiro toda
+    # vez custaria ~100ms num arquivo de 3 MB, vezes 50 ferramentas num turno.
+    # O trecho que interessa e sempre o fim do arquivo, entao ler o fim basta.
+    for linha in reversed(linhas):
+        # Pre-filtro barato, mas com agulha que SOBREVIVE ao escape do JSON:
+        # na linha crua o marcador aparece como source=\"plugin:telegram, com a
+        # aspa escapada, entao procurar CANAL aqui nao casa nunca. O teste de
+        # sabotagem pegou exatamente isso -- o hook liberava tudo, calado.
+        if "<channel" not in linha and "tool_use" not in linha:
+            continue
+        try:
+            d = json.loads(linha)
+        except Exception:
+            continue
+        t = _quando(d.get("timestamp") or "")
+        m = d.get("message") or {}
+        c = m.get("content")
+        if d.get("type") == "user" and isinstance(c, str) and CANAL in c:
+            mm = re.search(r"<channel\b[^>]*>(.*?)</channel>", c, re.S)
+            chegou, pedido = t, (mm.group(1).strip() if mm else c)
+            break                                    # achei o inicio do turno
+        if d.get("type") == "assistant" and isinstance(c, list):
+            for b in c:
+                if not isinstance(b, dict) or b.get("type") != "tool_use":
+                    continue
+                if REPLY in (b.get("name") or ""):
+                    respondeu = True
+                else:
+                    ferramentas += 1
+    if not chegou:
+        return None
+    return chegou, pedido, ferramentas, respondeu
+
+
+def insistencias(chave):
+    try:
+        d = json.loads(ESTADO.read_text())
+    except Exception:
+        d = {}
+    return d if d.get("chave") == chave else {"chave": chave, "n": 0}
+
+
+def main():
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:
+        libera()
+
+    ferramenta = payload.get("tool_name") or ""
+    if ferramenta in LIVRES or ferramenta.startswith("mcp__ai-memory__"):
+        libera()
+
+    caminho = payload.get("transcript_path")
+    if not caminho:
+        libera()
+
+    dados = turno_atual(caminho)
+    if not dados:
+        libera()                       # nao veio do Telegram: nao e comigo
+    chegou, pedido, usadas, respondeu = dados
+
+    if respondeu:
+        libera()                       # ja falou com ele neste turno
+
+    decorrido = time.time() - chegou
+    if usadas < LIMITE_FERRAMENTAS and decorrido < LIMITE_SEGUNDOS:
+        libera()                       # ainda esta dentro do combinado
+
+    chave = f"{payload.get('session_id','?')}:{int(chegou)}"
+    st = insistencias(chave)
+    if st["n"] >= MAX_INSISTENCIA:
+        libera()                       # nao consegue responder: nao trancar
+
+    st["n"] += 1
+    try:
+        ESTADO.parent.mkdir(parents=True, exist_ok=True)
+        ESTADO.write_text(json.dumps(st))
+    except Exception:
+        pass
+
+    porque = (f"{usadas} ferramentas" if usadas >= LIMITE_FERRAMENTAS
+              else f"{int(decorrido)}s de silencio")
+    nega(
+        f"PARE e fale com o dono primeiro ({porque} sem nenhuma palavra para ele).\n\n"
+        f"Ele pediu isto explicitamente em 10/09/2026: quer saber, logo no comeco, "
+        f"se voce ENTENDEU o pedido -- nao o resultado, o entendimento.\n\n"
+        f"Chame `{REPLY}` agora com 2-3 linhas:\n"
+        f"  1. o que voce entendeu que ele quer, com as suas palavras;\n"
+        f"  2. o que voce vai fazer, em passos curtos;\n"
+        f"  3. se houver, o que ficou ambiguo.\n\n"
+        f"Se `{REPLY}` nao estiver na sua lista, rode antes:\n"
+        f"  ToolSearch(query: \"select:{REPLY}\")\n\n"
+        f"O pedido dele foi: \"{pedido[:200]}\"\n\n"
+        f"Depois do resumo enviado, siga o trabalho normalmente -- esta trava "
+        f"nao volta neste turno."
+    )
+
+
+try:
+    main()
+except SystemExit:
+    raise
+except Exception:
+    pass
+sys.exit(0)

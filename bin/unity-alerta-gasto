@@ -1,0 +1,476 @@
+#!/usr/bin/env python3
+"""Alerta em tempo real de gasto excessivo no Claude Code.
+
+Roda como hook PostToolUse em TODAS as sessões do Claude Code nesta máquina.
+Acompanha incrementalmente o transcript de cada sessão e avisa no Telegram
+quando o custo estimado da sessão passa de limiares realmente anômalos.
+
+MÉTRICA (v2): custo estimado em USD, não "tokens".
+-------------------------------------------------
+A v1 somava cache_read + cache_creation + output + input e chamava isso de
+"tokens gastos". Isso é errado: cache_read_input_tokens é o CONTEXTO INTEIRO
+relido a cada turno — cresce quadraticamente com o tamanho da sessão e não é
+gasto novo. Medido em 2026-09-28 sobre os 42 estados salvos: 29 já tinham
+disparado o alerta, um chegou a 263.785.274 "tokens", e a sessão que disparou
+o alerta vermelho tinha feito menos de 50 tool calls. Com limiares de 2M/10M o
+alerta disparava em ~69% das sessões, ou seja, não sinalizava nada.
+
+ESCOLHA: em vez de simplesmente excluir o cache read, cada categoria de token é
+PONDERADA pelo preço real que a Anthropic cobra por ela, e o resultado vira USD.
+Motivos de preferir USD a "tokens ponderados":
+  - cache read custa 0,1x o input normal: barato, mas não é de graça — uma
+    sessão que relê 200k de contexto 600 vezes gasta dinheiro de verdade, e
+    excluir o cache read esconderia exatamente o caso patológico que queremos
+    pegar (loop longo com contexto gigante);
+  - output custa 5x o input, então contar token de saída igual a token de
+    entrada subestima quem escreve muito;
+  - Opus custa 5x Sonnet por token. Duas sessões com contagem idêntica de
+    tokens podem custar 5x uma da outra. Só o USD ordena as sessões do jeito
+    certo, e é a única unidade sobre a qual o dono consegue decidir algo.
+
+Tabela de preços (Anthropic, USD por 1M tokens, conferido em 2026-09-28):
+    Opus 5    $5 in / $25 out      Sonnet 5  $3 in / $15 out
+    Haiku 4.5 $1 in / $5  out
+Em toda a família atual os multiplicadores sobre o preço de input são os
+mesmos, então só a tarifa de input depende do modelo:
+    output = 5,00x | cache write (5m) = 1,25x | cache read = 0,10x
+
+LIMIARES (derivados dos dados reais, não chutados)
+--------------------------------------------------
+Recalculando as 42 sessões salvas em ~/.local/share/unity-alerta-gasto/ com
+esta métrica, a distribuição de custo por sessão ficou (2026-09-28):
+    p25 US$  1,46   p50 US$  2,72   p75 US$ 10,67
+    p90 US$ 39,01   p95 US$ 58,95   máx US$ 86,98
+Quantas das 42 sessões disparariam por limiar:
+    >= US$ 10 -> 12 (29%)   >= US$ 20 ->  6 (14%)   >= US$ 30 ->  5 (12%)
+    >= US$ 40 ->  4 (10%)   >= US$ 60 ->  2 ( 5%)   >= US$ 80 ->  2 ( 5%)
+    >= US$100 ->  0 ( 0%)
+Uma sessão longa e normal (150-230 respostas do modelo) fica em US$ 15. Por
+isso: aviso em US$ 30 (~p88, 5 de 42 = 12%) e crítico em US$ 80 (~p95,
+2 de 42 = 5%). Contra os 69% da v1. Para reconferir a escolha, basta
+recalcular os transcripts em ~/.claude/projects/ com custo_usd() abaixo.
+
+REGRAS DE CONFIABILIDADE E DESEMPENHO:
+1. Rápido (<10ms): busca por byte_offset no transcript e lê apenas os bytes novos.
+2. Seguro: NUNCA lança exceções nem trava (sempre sai com código 0).
+3. Sem chamadas a LLM nem rede: leitura exclusivamente local.
+4. Estado persistido por sessão em ~/.local/share/unity-alerta-gasto/<session_id>.json.
+5. Limpeza oportunista periódica de estados antigos (>7 dias).
+"""
+import importlib.util
+import json
+import os
+import random
+import sys
+import time
+from pathlib import Path
+
+STATE_DIR = Path.home() / ".local/share/unity-alerta-gasto"
+LIB_PATH = "/home/reaper/.local/bin/unity-lib.py"
+
+# Versão do formato/métrica do estado. Estado gravado com versão diferente é
+# migrado (ver carregar_estado): o valor acumulado da métrica velha não tem
+# como ser convertido no novo, então é descartado junto com os alertas já
+# disparados.
+STATE_VERSION = 2
+
+# Preço de input em USD por 1M tokens, por família de modelo.
+INPUT_USD_POR_MTOK = {
+    "opus": 5.0,
+    "sonnet": 3.0,
+    "haiku": 1.0,
+}
+# Modelo desconhecido (ex.: "<synthetic>", ou um modelo novo): usa a tarifa do
+# Sonnet, que é a mais comum aqui.
+INPUT_USD_POR_MTOK_PADRAO = 3.0
+
+# Multiplicadores sobre a tarifa de input. Iguais em toda a família atual.
+MULT_OUTPUT = 5.00
+MULT_CACHE_WRITE = 1.25
+MULT_CACHE_READ = 0.10
+
+LEVEL_1_THRESHOLD_USD = 30.0
+LEVEL_2_THRESHOLD_USD = 80.0
+
+# Mediana medida das 42 sessões salvas (US$ 2,72). Só serve para dar escala na
+# mensagem do Telegram ("essa sessão é Nx uma normal").
+MEDIANA_USD = 2.72
+
+LEVEL_1_NAME = "usd30"
+LEVEL_2_NAME = "usd80"
+
+
+def carregar_lib():
+    """Importa unity-lib dinamicamente sem lançar exceções."""
+    try:
+        spec = importlib.util.spec_from_file_location("unity_lib", LIB_PATH)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
+
+
+def compactar_nome_projeto(caminho_ou_dir):
+    """Encurta o nome do projeto/diretório para caber na linha do Telegram (<25 caracteres)."""
+    if not caminho_ou_dir:
+        return "geral"
+    s = str(caminho_ou_dir).strip()
+    home = str(Path.home())
+    if s in ("-home-reaper", home, "~"):
+        return "orquestrador"
+    if s.startswith(home):
+        s = s[len(home):].lstrip("/")
+        if not s:
+            return "orquestrador"
+    if "/scratchpad/" in s:
+        s = s.split("/scratchpad/")[-1] or "scratchpad"
+    elif "-scratchpad-" in s:
+        s = s.split("-scratchpad-")[-1] or "scratchpad"
+    elif s.startswith("-tmp-claude-"):
+        if "scratchpad" in s:
+            sub = s.split("scratchpad")[-1].lstrip("-/")
+            s = sub if sub else "scratchpad"
+    elif s.startswith("-home-reaper-"):
+        raw = s[len("-home-reaper-"):]
+        if raw.startswith("projetos-"):
+            s = raw[len("projetos-"):]
+        elif raw.startswith("-local-bin") or raw == "-local-bin":
+            s = ".local/bin"
+        else:
+            s = raw
+    elif s.startswith("projetos/"):
+        s = s[len("projetos/"):]
+
+    s = s.rstrip("/")
+    if len(s) > 20:
+        parts = s.split("/")
+        if len(parts) > 1:
+            s = parts[-1]
+        if len(s) > 20:
+            s = s[:19] + "…"
+    return s or "geral"
+
+
+def familia_modelo(model):
+    """Reduz o id do modelo à família tarifária ('opus'/'sonnet'/'haiku')."""
+    m = (model or "").lower()
+    if "opus" in m:
+        return "opus"
+    if "sonnet" in m:
+        return "sonnet"
+    if "haiku" in m:
+        return "haiku"
+    return ""
+
+
+def custo_usd(usage, model):
+    """Custo estimado em USD de UMA resposta do modelo, pelo preço real de cada
+    categoria de token. Ver o cabeçalho do arquivo para a tabela de preços."""
+    tarifa = INPUT_USD_POR_MTOK.get(familia_modelo(model), INPUT_USD_POR_MTOK_PADRAO)
+    inp = usage.get("input_tokens") or 0
+    out = usage.get("output_tokens") or 0
+    cc = usage.get("cache_creation_input_tokens") or 0
+    cr = usage.get("cache_read_input_tokens") or 0
+    equivalente_input = (
+        inp
+        + out * MULT_OUTPUT
+        + cc * MULT_CACHE_WRITE
+        + cr * MULT_CACHE_READ
+    )
+    return equivalente_input * tarifa / 1_000_000.0
+
+
+def fmt_usd(v):
+    """Formata USD curto, com vírgula decimal (ex: 'US$ 31', 'US$ 2,40')."""
+    try:
+        if v >= 10:
+            return f"US$ {v:.0f}"
+        return ("US$ %.2f" % v).replace(".", ",")
+    except Exception:
+        return "US$ ?"
+
+
+def limpar_estados_antigos(state_dir, max_age_days=7):
+    """Remove arquivos de estado obsoletos (>7 dias ou cujo transcript não existe mais)."""
+    try:
+        cutoff = time.time() - (max_age_days * 86400)
+        for item in state_dir.glob("*.json"):
+            try:
+                st = item.stat()
+                if st.st_mtime < cutoff:
+                    item.unlink(missing_ok=True)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def encontrar_transcript(session_id, transcript_path_hint=None):
+    """Localiza o arquivo de transcript correspondente à sessão."""
+    if transcript_path_hint and os.path.isfile(transcript_path_hint):
+        return transcript_path_hint
+
+    # Fallback: procura em ~/.claude/projects/*/<session_id>.jsonl
+    if session_id:
+        projects_dir = Path.home() / ".claude/projects"
+        if projects_dir.exists():
+            matches = list(projects_dir.glob(f"*/{session_id}.jsonl"))
+            if matches:
+                return str(matches[0])
+    return None
+
+
+def processar_evento(payload):
+    session_id = payload.get("session_id") or payload.get("sessionId")
+    if not session_id:
+        return
+
+    transcript_path_hint = payload.get("transcript_path") or payload.get("transcriptPath")
+    cwd = payload.get("cwd") or ""
+
+    transcript_path = encontrar_transcript(session_id, transcript_path_hint)
+    if not transcript_path or not os.path.isfile(transcript_path):
+        return
+
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    state_file = STATE_DIR / f"{session_id}.json"
+
+    primeira_vez = not state_file.exists()
+    byte_offset = 0
+    spend_usd = 0.0
+    respostas = 0
+    gasto_por_familia = {}
+    alerted_levels = []
+    seen_msg_ids = []
+
+    if not primeira_vez:
+        try:
+            state = json.loads(state_file.read_text(encoding="utf-8"))
+            byte_offset = int(state.get("byte_offset", 0))
+            seen_msg_ids = list(state.get("seen_msg_ids", []))
+
+            if int(state.get("state_version", 1)) == STATE_VERSION:
+                spend_usd = float(state.get("spend_usd", 0.0))
+                respostas = int(state.get("respostas", 0))
+                gasto_por_familia = dict(state.get("gasto_por_familia", {}))
+                alerted_levels = list(state.get("alerted_levels", []))
+            else:
+                # MIGRAÇÃO de estado v1 (métrica quebrada, ver cabeçalho).
+                # 'cumulative_tokens' era calculado somando o cache read e não
+                # tem conversão possível para USD, então é descartado; e
+                # 'alerted_levels' guardava níveis ('2M'/'10M') que já não
+                # existem. Zerar os dois é o que impede que uma sessão herde o
+                # estado antigo e fique ou permanentemente calada (achando que
+                # já alertou) ou permanentemente em alarme (custo inflado).
+                # byte_offset e seen_msg_ids são preservados de propósito: a
+                # contagem recomeça daqui, sem reler o transcript inteiro. É a
+                # mesma política já usada quando o hook vê uma sessão pela
+                # primeira vez — subestima, nunca superestima, então não gera
+                # alerta falso.
+                spend_usd = 0.0
+                respostas = 0
+                gasto_por_familia = {}
+                alerted_levels = []
+        except Exception:
+            primeira_vez = True
+            byte_offset = 0
+            spend_usd = 0.0
+            respostas = 0
+            gasto_por_familia = {}
+            alerted_levels = []
+            seen_msg_ids = []
+
+    try:
+        with open(transcript_path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            file_size = fh.tell()
+
+            if primeira_vez:
+                # Sessao ja existente (ou estado corrompido) na primeira vez que
+                # este hook a ve: NAO reprocessa o historico inteiro como se
+                # fosse gasto "agora" (uma sessao de horas ja teria milhoes de
+                # tokens acumulados e dispararia um alerta falso na hora). So
+                # comeca a contar do byte atual em diante.
+                novo_estado = {
+                    "state_version": STATE_VERSION,
+                    "session_id": session_id,
+                    "byte_offset": file_size,
+                    "spend_usd": 0.0,
+                    "respostas": 0,
+                    "gasto_por_familia": {},
+                    "alerted_levels": [],
+                    "seen_msg_ids": [],
+                    "updated_at": time.time(),
+                }
+                tmp_file = state_file.with_suffix(".tmp")
+                tmp_file.write_text(json.dumps(novo_estado, indent=2), encoding="utf-8")
+                tmp_file.replace(state_file)
+                return
+
+            if file_size < byte_offset:
+                byte_offset = 0
+                spend_usd = 0.0
+                respostas = 0
+                gasto_por_familia = {}
+                seen_msg_ids = []
+
+            fh.seek(byte_offset)
+            new_data = fh.read()
+    except Exception:
+        return
+
+    if not new_data:
+        # Nada novo no arquivo
+        return
+
+    if not new_data.endswith(b"\n"):
+        last_nl = new_data.rfind(b"\n")
+        if last_nl == -1:
+            # Nenhuma linha completa nova
+            return
+        complete_data = new_data[:last_nl + 1]
+        new_byte_offset = byte_offset + last_nl + 1
+    else:
+        complete_data = new_data
+        new_byte_offset = byte_offset + len(new_data)
+
+    # dict em vez de set: preserva a ordem de inserção, então o corte dos
+    # últimos 2000 mais abaixo realmente descarta os mais antigos.
+    seen = dict.fromkeys(seen_msg_ids)
+
+    for line in complete_data.splitlines():
+        if b"usage" not in line:
+            continue
+        try:
+            d = json.loads(line.decode("utf-8", errors="ignore"))
+        except Exception:
+            continue
+
+        msg = d.get("message")
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+
+        usage = msg.get("usage")
+        if not isinstance(usage, dict):
+            continue
+
+        mid = msg.get("id") or d.get("uuid")
+        if mid:
+            if mid in seen:
+                continue
+            seen[mid] = None
+
+        modelo = msg.get("model")
+        c = custo_usd(usage, modelo)
+        spend_usd += c
+        respostas += 1
+        fam = familia_modelo(modelo)
+        if fam:
+            gasto_por_familia[fam] = gasto_por_familia.get(fam, 0.0) + c
+
+    # Avaliação de limiares
+    novos_alertas = []
+    if spend_usd >= LEVEL_2_THRESHOLD_USD:
+        if LEVEL_2_NAME not in alerted_levels:
+            novos_alertas.append(LEVEL_2_NAME)
+            alerted_levels.append(LEVEL_2_NAME)
+        if LEVEL_1_NAME not in alerted_levels:
+            alerted_levels.append(LEVEL_1_NAME)
+    elif spend_usd >= LEVEL_1_THRESHOLD_USD:
+        if LEVEL_1_NAME not in alerted_levels:
+            novos_alertas.append(LEVEL_1_NAME)
+            alerted_levels.append(LEVEL_1_NAME)
+
+    # Disparo de alerta para o Telegram.
+    # Texto puro, sem markdown, linhas de no máximo ~35 caracteres (ele lê no
+    # celular) e sempre com o que fazer a seguir — só o número não serve.
+    if novos_alertas:
+        lib = carregar_lib()
+        if lib and hasattr(lib, "send_telegram"):
+            proj = compactar_nome_projeto(cwd)
+            gasto = fmt_usd(spend_usd)
+            if gasto_por_familia:
+                fam_top = max(gasto_por_familia, key=gasto_por_familia.get)
+            else:
+                fam_top = "modelo"
+            if respostas > 0:
+                por_resp = ("US$ %.2f" % (spend_usd / respostas)).replace(".", ",")
+            else:
+                por_resp = "US$ ?"
+
+            linhas = [
+                "🔴 Gasto ANORMAL na sessão"
+                if LEVEL_2_NAME in novos_alertas
+                else "⚠️ Gasto alto na sessão",
+                proj,
+                f"{gasto} até agora",
+                f"{respostas} respostas · {fam_top}",
+                f"{por_resp} por resposta",
+                "",
+            ]
+            if LEVEL_2_NAME in novos_alertas:
+                # MEDIANA_USD: mediana medida das 42 sessões (US$ 2,72),
+                # arredondada. Dá a escala do quanto essa fugiu do normal.
+                vezes = max(2, int(spend_usd / MEDIANA_USD))
+                linhas += [
+                    "Sessão normal sua custa",
+                    f"uns US$ 3 — essa é {vezes}x isso.",
+                    "Vê se travou em loop:",
+                    "/cost mostra o detalhe.",
+                    "Se não tá rendendo, para.",
+                ]
+            else:
+                linhas += [
+                    "Rode /cost pra conferir.",
+                    "Se o contexto já tá enorme,",
+                    "/compact corta o gasto.",
+                    "Tarefa longa? Delega o",
+                    "braçal pro unity-delegar.",
+                ]
+            lib.send_telegram("\n".join(linhas), silent=False)
+
+    # Salva o estado atualizado (mantém seen_msg_ids limitado aos últimos 2000)
+    seen_list = list(seen.keys())[-2000:]
+    novo_estado = {
+        "state_version": STATE_VERSION,
+        "session_id": session_id,
+        "byte_offset": new_byte_offset,
+        "spend_usd": round(spend_usd, 4),
+        "respostas": respostas,
+        "gasto_por_familia": {k: round(v, 4) for k, v in gasto_por_familia.items()},
+        "alerted_levels": alerted_levels,
+        "seen_msg_ids": seen_list,
+        "updated_at": time.time(),
+    }
+
+    try:
+        tmp_file = state_file.with_suffix(".tmp")
+        tmp_file.write_text(json.dumps(novo_estado, indent=2), encoding="utf-8")
+        tmp_file.replace(state_file)
+    except Exception:
+        pass
+
+    # Limpeza oportunista (1% de chance)
+    if random.random() < 0.01:
+        limpar_estados_antigos(STATE_DIR)
+
+
+def main():
+    try:
+        raw = sys.stdin.read()
+        if not raw.strip():
+            return
+        payload = json.loads(raw)
+        if isinstance(payload, dict):
+            processar_evento(payload)
+    except Exception:
+        pass
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        pass
+    sys.exit(0)

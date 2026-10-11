@@ -3,7 +3,7 @@
 
 Separado do `unity-pendencias` pelo mesmo motivo que `unity-costs-telegram` é
 separado do `unity-costs`: relatar e avisar são decisões diferentes. O relatório
-responde quando o Igor pergunta; o aviso decide sozinho se vale interromper.
+responde quando o dono pergunta; o aviso decide sozinho se vale interromper.
 
 REGRA CENTRAL — avisa por MUDANÇA, não por existência.
 
@@ -40,7 +40,7 @@ def carregar_lib():
 def levantar():
     """(texto_do_relatorio, chaves) — chaves identificam cada item em aberto.
 
-    A chave da sessão e do despacho é o id; a da memória é o caminho da página.
+    A chave da sessão e da delegação é o id; a da memória é o caminho da página.
     São estáveis entre execuções, que é o que o comparador exige. O tempo
     parado NÃO entra na chave de propósito: ele muda a cada verificação e faria
     todo item parecer novo sempre.
@@ -58,7 +58,7 @@ def levantar():
     chaves = set()
     for linha in texto.splitlines():
         linha = linha.strip()
-        # "aa11bb22 — parada há 4h12"  /  "394f6abc — gemini → adega-pilar"
+        # "aa11bb22 — parada há 4h12"  /  "394f6abc — gemini → projeto-exemplo"
         if " — " in linha:
             chaves.add("item:" + linha.split(" — ")[0].strip())
         elif linha.endswith(".md"):

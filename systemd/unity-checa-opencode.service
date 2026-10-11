@@ -1,0 +1,9 @@
+[Unit]
+Description=Testa se os modelos gratis do opencode zen ainda existem (escrita real de arquivo)
+
+[Service]
+Type=oneshot
+ExecStart=/home/reaper/.local/bin/unity-checa-opencode
+# opencode e unity-lib vivem em ~/.local/bin e ~/.opencode/bin, fora do PATH
+# minimo que um servico do systemd enxerga.
+Environment=PATH=/home/reaper/.local/bin:/home/reaper/.opencode/bin:/usr/local/bin:/usr/bin:/bin

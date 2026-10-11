@@ -3,15 +3,15 @@
 
 Por que existe: a Unity normal é uma sessão do Claude Code. Quando a janela de
 5 h da assinatura estoura, essa sessão não responde mais e o canal fica MUDO —
-sem erro, sem aviso, o Igor manda mensagem e não volta nada. Este processo é a
+sem erro, sem aviso, o dono manda mensagem e não volta nada. Este processo é a
 saída de emergência: fala com o mesmo bot, pelo mesmo token, mas o cérebro é o
 DeepSeek v4 Flash rodando dentro do opencode, que é grátis e não consome cota
 da Anthropic.
 
 Ele NÃO substitui a Unity. Ele é pior e sabe disso: avisa no primeiro contato
-que está em modo econômico. O que ele preserva é a capacidade de despachar —
-`unity-despachar --nivel gemini` continua funcionando, e o Gemini também é
-grátis. Ou seja: mesmo com a cota do Claude zerada, o Igor ainda consegue mandar
+que está em modo econômico. O que ele preserva é a capacidade de delegar —
+`unity-delegar --nivel gemini` continua funcionando, e o Gemini também é
+grátis. Ou seja: mesmo com a cota do Claude zerada, o dono ainda consegue mandar
 trabalho para um executor de verdade.
 
 ## A trava do Telegram
@@ -31,6 +31,7 @@ responderia de novo tudo que a Unity já tinha respondido antes de cair.
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -51,20 +52,68 @@ SESSAO = ESTADO / "fallback-sessao.json"
 
 # Diretório próprio, e não o $HOME como a Unity normal: o opencode lê o
 # AGENTS.md do diretório de trabalho, e escrever um AGENTS.md na raiz da home
-# afetaria toda sessão de opencode que o Igor abrisse ali. O agente continua
-# alcançando qualquer projeto por caminho absoluto e pelo `unity-despachar`.
+# afetaria toda sessão de opencode que o dono abrisse ali. O agente continua
+# alcançando qualquer projeto por caminho absoluto e pelo `unity-delegar`.
 TRABALHO = Path.home() / ".local/share/unity-fallback"
 AGENTS = TRABALHO / "AGENTS.md"
 PROMPTS = Path.home() / ".claude/orquestrador"
 
 OPENCODE = "/home/reaper/.opencode/bin/opencode"
-MODELO = os.environ.get("UNITY_OPENCODE_MODEL", "opencode/deepseek-v4-flash-free")
+# O catalogo gratis do opencode zen rotaciona. Em 24/08/2026 o padrao antigo
+# (`deepseek-v4-flash-free`) E AS DUAS RESERVAS (`north-mini-code-free`,
+# `ling-3.0-flash-free`) tinham sumido — ou seja, a saida de emergencia inteira
+# estava morta, sem ninguem saber, porque modelo inexistente volta como
+# `UnknownError / Unexpected server error` e nao como "modelo nao existe".
+# Ter reserva nao adianta se ela envelhece junto com o titular.
+MODELO = os.environ.get("UNITY_OPENCODE_MODEL", "opencode/mimo-v2.5-free")
 TIMEOUT_RESPOSTA = int(os.environ.get("UNITY_FALLBACK_TIMEOUT", "300"))
 
-# Sessão do opencode expira sozinha: contexto do DeepSeek é curto e uma sessão
-# de dias vira prompt gigante e caro em latência. Duas horas cobrem uma conversa
-# real sem deixar o histórico crescer sem limite.
-VALIDADE_SESSAO = 2 * 3600
+# O grátis do opencode zen é um proxy para um provedor de verdade, e o provedor
+# quebra sozinho. Em 03/08 às 00:05 o pedido do jobcraft voltou em 4 s com HTTP
+# 402 "Insufficient Balance" — saldo do upstream do DeepSeek, não do dono: o
+# mesmo pedido, no mesmo modelo, funcionou minutos depois. Erro de um modelo não
+# pode calar o canal, então há reserva. Ambos verificados chamando ferramenta com
+# este mesmo AGENTS.md; um modelo que não roda `bash` seria reserva inútil, já
+# que a Unity econômica existe para despachar via `unity-delegar`.
+# Reservas escolhidas por teste real de escrita de arquivo (nao por nome).
+# 07/09/2026: `hy3-free` sumiu do catalogo zen e `nemotron-3.5-lightning-free`
+# passou a estourar 90s. Trocados por `ling-3.0-flash-fin-free` (7s) e
+# `muse-spark-1.2-contributor-free` (11s), ambos aprovados no teste de escrita.
+# Ficaram de fora `x-preview-f-free`/`big-pickle` (nao terminaram) e
+# `nemotron-3-ultra-free` (escreveu, mas devolveu 502 da Nvidia em 24/08).
+MODELOS_RESERVA = [m.strip() for m in os.environ.get(
+    "UNITY_OPENCODE_MODELOS_RESERVA",
+    "opencode/ling-3.0-flash-fin-free,opencode/muse-spark-1.2-contributor-free").split(",")
+    if m.strip()]
+
+# Piso de tempo para uma tentativa de reserva. Sem ele, um primeiro modelo que
+# consome quase todo o prazo deixaria a reserva com 3 s — tentativa que só serve
+# para trocar um erro por um timeout.
+MINIMO_PARA_RESERVA = 45
+
+# Sentinela: estourar o relógio local não é recusa da API, e merece outra frase.
+# Trocar de modelo também não adianta — quem estourou o prazo foi a tarefa.
+TIMEOUT = "__timeout__"
+
+# Quanto tempo de SILÊNCIO encerra a conversa.
+#
+# O corte anterior era de 2 h contadas do INÍCIO da sessão e nunca renovadas —
+# ou seja, o relógio cortava uma conversa viva no meio. Medido nos transcripts
+# do próprio fallback: em 04/08 às 00:32 o dono escreveu "quando terminar de
+# arrumar o hero, me manda a foto" 2 h 09 min depois da mensagem anterior, caiu
+# numa sessão em branco e ouviu "não tenho nenhuma tarefa de hero no meu
+# contexto". Um "Sim" solto em 03/08 morreu do mesmo jeito. Ele lia isso como a
+# Unity não entender o pedido; era amnésia.
+#
+# Ociosidade é o critério certo: quem ficou 45 min calado mudou de assunto; quem
+# está respondendo agora, não.
+OCIOSIDADE_MAX = int(os.environ.get("UNITY_FALLBACK_OCIOSIDADE", str(45 * 60)))
+
+# Teto absoluto, porque `--continue` cresce sem limite e o contexto do DeepSeek é
+# curto: uma conversa ativa o dia inteiro viraria prompt gigante, lento e
+# truncado. Conta do início e NÃO é renovado — é o limite de crescimento que o
+# corte antigo tentava impor, agora separado do critério de fim de assunto.
+VIDA_MAXIMA = int(os.environ.get("UNITY_FALLBACK_VIDA_MAXIMA", str(12 * 3600)))
 
 
 def api(metodo, params=None, timeout=70):
@@ -87,33 +136,93 @@ def escrever_agents():
 
     Reaproveita a persona e o roteamento reais da Unity, para o modo econômico
     não ter personalidade nem regras próprias — divergir aqui significaria o
-    Igor conversando com duas Unitys diferentes conforme a cota do dia.
+    dono conversando com duas Unitys diferentes conforme a cota do dia.
     """
-    partes = ["# Você é a Unity, em modo econômico\n"]
-    for nome in ("persona.md", "roteamento.md", "projetos.md"):
-        caminho = PROMPTS / nome
-        if caminho.exists():
-            partes.append(caminho.read_text())
-    partes.append("""
-# O que muda no modo econômico
+    # As regras do modo econômico vêm ANTES da persona, e não depois.
+    #
+    # Ficavam no fim, atrás de ~20 KB de persona + roteamento + índice de
+    # projetos. Medido em 02/08: o dono pediu trabalho no visual do jobcraft e o
+    # DeepSeek passou 5min46 tentando FAZER a tarefa sozinho até estourar o
+    # timeout de 300 s — nunca chegou a delegar. A regra "delegue para o gemini"
+    # existia, mas enterrada no fim de um prompt longo lido por um modelo
+    # pequeno. Regra que o modelo não segue é regra que não está escrita.
+    #
+    # O resto (persona, tom, índice de projetos) segue valendo e vem depois:
+    # divergir da Unity normal significaria o dono conversando com duas Unitys
+    # diferentes conforme a cota do dia.
+    partes = ["""# Você é a Unity, em modo econômico
 
 Você está rodando no DeepSeek v4 Flash porque a cota do Claude acabou. Isso é
 temporário e volta sozinho quando a janela zera.
 
-Regras que MUDAM enquanto você está assim:
+## A regra mais importante: VOCÊ NÃO FAZ O TRABALHO, VOCÊ DESPACHA
 
-- **Não despache para `claude` nem para `sonnet`.** Não há cota. Tentar é
-  garantir um despacho que volta com erro.
-- Para trabalho de código, despache para `gemini`, que é grátis:
-  `unity-despachar --nivel gemini --projeto <slug> --dir <caminho> "<tarefa em inglês>"`
+Você é o atendimento, não o executor. Pedido que envolva mexer em código,
+arquivo ou script de projeto vai para o Gemini — que é grátis — e vai **na
+primeira resposta**, não depois de você investigar:
+
+    unity-delegar --nivel gemini --projeto <slug> --dir <caminho> "<tarefa em inglês>"
+
+O comando volta na hora, com o id da delegação. Responda ao dono dizendo o que
+despachou e para onde, e pare por aí. Ficar lendo arquivo e rodando script você
+mesma estoura o tempo de resposta e o dono não recebe nada.
+
+Só responda direto, sem delegar, o que for pergunta sobre estado (uso de cota,
+o que está rodando, o que ficou pendente).
+
+## Quando faltar contexto: PROCURE ANTES DE PERGUNTAR
+
+Sua conversa recomeça do zero de vez em quando, e a troca entre você e a Unity
+do Claude não passa histórico. Então vai acontecer de o dono responder "sim", ou
+falar de "aquilo", ou dizer "quando terminar de arrumar o hero" — coisas que
+continuam um assunto que **você não tem**. Ele não vai repetir; para ele a
+conversa nunca parou.
+
+Nesse caso NÃO responda "não tenho contexto disso". Procure primeiro:
+
+    unity-memoria --recente          # do que a gente estava falando
+    unity-memoria "hero do site"     # busca por assunto
+
+Isso lê o ai-memory, que guarda a narrativa de todas as sessões — inclusive as
+que rodaram no Claude.
+
+**Teto: DUAS chamadas do `unity-memoria`, e acabou.** Depois da segunda você
+responde com o que tiver. Isso não é sugestão — é o limite.
+
+Você está procurando UMA coisa: qual é o assunto. "Hero" + o resultado
+"Fix and beautify the hero section of the Cliente C guesthouse" já é resposta
+completa; o assunto é o site da pousada Cliente C. A partir daí você já sabe o
+bastante para delegar ou responder. Reformular a busca mais oito vezes não
+melhora nada, e ler o index.html do projeto é exatamente o que você NÃO faz —
+isso é trabalho do executor.
+
+Se as duas buscas não trouxerem nada, aí sim pergunte — uma coisa só, curta.
+
+Mais abaixo o roteamento manda consultar o ai-memory com `memory_query`. Aquilo
+vale para a Unity do Claude, que tem o ai-memory como ferramenta MCP. **Você não
+tem.** No modo econômico o caminho é o comando `unity-memoria`, e só ele.
+
+## O resto das regras daqui
+
+- **Não delegue para `claude` nem para `sonnet`.** Não há cota. Tentar é
+  garantir uma delegação que volta com erro.
 - Se a tarefa exigir mesmo Opus (planejar, arquitetura, causa desconhecida),
-  NÃO improvise: diga ao Igor que isso precisa esperar a cota voltar, e diga
+  NÃO improvise: diga ao dono que isso precisa esperar a cota voltar, e diga
   quanto falta (`unity-uso`).
 - Seja mais curta que o normal. Você é mais lenta agora; texto longo piora.
+- Se o dono pedir algo que você não tem como fazer, **diga na hora**. Você só
+  manda TEXTO no Telegram — não manda foto, print nem arquivo. Não saia
+  vasculhando os scripts atrás de uma capacidade que não existe: isso queimou 4
+  min num teste e o dono não recebeu resposta nenhuma.
+- Diga que está em modo econômico **uma vez**, no primeiro contato. Depois pare
+  de repetir — o dono já sabe.
 
-Diga que está em modo econômico **uma vez**, no primeiro contato. Depois pare
-de repetir — o Igor já sabe.
-""")
+---
+"""]
+    for nome in ("persona.md", "roteamento.md", "projetos.md"):
+        caminho = PROMPTS / nome
+        if caminho.exists():
+            partes.append(caminho.read_text())
     AGENTS.write_text("\n\n".join(partes))
 
 
@@ -125,28 +234,117 @@ def continuar_conversa():
     última sessão DAQUELE diretório — por isso o diretório de trabalho é
     exclusivo deste processo.
 
-    O prazo existe porque `--continue` cresce sem limite: o contexto do DeepSeek
-    é curto, e uma sessão de dias vira prompt gigante, lento e truncado. Duas
-    horas cobrem uma conversa real e depois a memória recomeça.
+    São dois prazos com papéis diferentes: `OCIOSIDADE_MAX` decide se o assunto
+    acabou (e é RENOVADO a cada mensagem, senão cortaria conversa viva), e
+    `VIDA_MAXIMA` limita o crescimento do histórico (e por isso NÃO é renovado).
     """
+    agora = time.time()
     try:
-        if time.time() - json.loads(SESSAO.read_text())["desde"] < VALIDADE_SESSAO:
+        estado = json.loads(SESSAO.read_text())
+        ocioso, idade = agora - estado["ultima"], agora - estado["desde"]
+        if ocioso < OCIOSIDADE_MAX and idade < VIDA_MAXIMA:
+            estado["ultima"] = agora
+            SESSAO.write_text(json.dumps(estado))
             return True
+        print("conversa reiniciada: " + (
+            f"{int(ocioso // 60)} min de silêncio" if ocioso >= OCIOSIDADE_MAX
+            else f"sessão já com {int(idade // 3600)} h"), file=sys.stderr)
     except Exception:
+        # Inclui o estado no formato antigo (só `desde`): recomeça uma vez e
+        # passa a gravar no formato novo.
         pass
-    SESSAO.write_text(json.dumps({"desde": time.time()}))
+    SESSAO.write_text(json.dumps({"desde": agora, "ultima": agora}))
     return False
 
 
-def responder(texto):
-    """Roda o opencode e devolve a resposta dele, já limpa de segredo."""
-    cmd = [OPENCODE, "run", texto, "--model", MODELO,
-           "--dir", str(TRABALHO), "--auto"]
-    if continuar_conversa():
+ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+# Rodapé que o PRÓPRIO modelo escreve, porque a persona no AGENTS.md manda
+# escrever. Some daqui para não sair em duplicata: quem anexa o rodapé
+# autoritativo é o `send_telegram(rodape=True)`, que lê o uso na hora do envio
+# em vez de repetir o número que o modelo viu no meio da conversa.
+RODAPE_MODELO = re.compile(r"^\s*(📊|DeepSeek US\$|Gemini\s)")
+
+
+def extrair_resposta(saida):
+    """Tira a fala do assistente dos eventos JSON do `opencode run --format json`.
+
+    Vale a pena existir porque a saída "bonita" do opencode NÃO é analisável: ela
+    vem com escapes ANSI, com o banner `> build · <modelo>` e com o eco de cada
+    ferramenta chamada. A heurística anterior tentava cortar por prefixo (`$`,
+    `>`, `→`) e falhava justamente por causa do ANSI — `\\x1b[0m>` não começa com
+    `>` para o `startswith`, então o corte nunca acontecia e o dono recebia o
+    passo a passo cru no Telegram, escapes inclusive.
+
+    Os eventos JSON não têm essa ambiguidade: `type == "text"` é fala do
+    assistente e nada mais. Devolve string vazia se não achar nada — quem chama
+    decide o que fazer com isso.
+    """
+    partes = []
+    for linha in saida.splitlines():
+        linha = linha.strip()
+        if not linha.startswith("{"):
+            continue
+        try:
+            ev = json.loads(linha)
+        except Exception:
+            continue
+        if ev.get("type") != "text":
+            continue
+        texto = ((ev.get("part") or {}).get("text") or "").strip()
+        if texto:
+            partes.append(texto)
+    return "\n".join(partes).strip()
+
+
+def extrair_erro(saida):
+    """Devolve (mensagem, status HTTP) do primeiro evento `error`, ou None.
+
+    Existe porque `extrair_resposta` só enxerga `type == "text"`: quando a API
+    recusa, não há evento de texto nenhum e a rede de segurança despejava a saída
+    crua no Telegram — o dono recebeu o JSON do 402 inteiro, com `responseBody` e
+    cabeçalhos. Erro de provedor tem que virar frase, e virar troca de modelo.
+    """
+    for linha in saida.splitlines():
+        linha = linha.strip()
+        if not linha.startswith("{"):
+            continue
+        try:
+            ev = json.loads(linha)
+        except Exception:
+            continue
+        if ev.get("type") != "error":
+            continue
+        erro = ev.get("error") or {}
+        dados = erro.get("data") or {}
+        return (dados.get("message") or erro.get("name") or "erro desconhecido",
+                dados.get("statusCode"))
+    return None
+
+
+def tirar_rodape_do_modelo(texto):
+    """Remove o rodapé de uso que o modelo escreveu no fim da própria resposta."""
+    linhas = texto.splitlines()
+    while linhas and (not linhas[-1].strip() or RODAPE_MODELO.match(linhas[-1])):
+        linhas.pop()
+    return "\n".join(linhas).strip()
+
+
+def _rodar(texto, modelo, continuar, timeout):
+    """Uma tentativa. Devolve (resposta, erro, saída crua) — só um dos três vale.
+
+    `resposta` preenchida é sucesso. `erro` preenchido é recusa da API, e aí vale
+    trocar de modelo. `saída crua` sem os outros dois é o formato do opencode ter
+    mudado: feio, mas melhor que canal mudo, e trocar de modelo não resolveria.
+    """
+    # `--format json` em vez da saída formatada: ver `extrair_resposta`.
+    cmd = [OPENCODE, "run", texto, "--model", modelo,
+           "--dir", str(TRABALHO), "--auto", "--format", "json"]
+    if continuar:
         cmd.append("--continue")
 
     # PATH explícito: o systemd entrega um PATH mínimo, e sem ~/.local/bin o
-    # agente não acha `unity-despachar` nem `unity-uso` — perderia justamente a
+    # agente não acha `unity-delegar` nem `unity-uso` — perderia justamente a
     # capacidade que justifica este modo existir.
     env = dict(os.environ)
     env["PATH"] = f"{Path.home()}/.local/bin:{Path.home()}/.opencode/bin:" + env.get("PATH", "")
@@ -154,23 +352,77 @@ def responder(texto):
 
     try:
         p = subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=TIMEOUT_RESPOSTA, cwd=str(TRABALHO), env=env)
+                           timeout=timeout, cwd=str(TRABALHO), env=env)
     except subprocess.TimeoutExpired:
-        return f"⏳ Demorei demais ({TIMEOUT_RESPOSTA}s) e cortei. Tenta pedir menor?"
+        return (None, (TIMEOUT, timeout), None)
 
     saida = (p.stdout or "").strip()
     if not saida:
-        return "🔴 Não consegui responder (o opencode voltou vazio)."
+        return (None, ("o opencode voltou vazio", None), None)
 
-    # O `opencode run` imprime as chamadas de ferramenta antes da resposta.
-    # Interessa a última fala, não o passo a passo.
-    linhas = [l for l in saida.splitlines() if l.strip()]
-    corte = 0
-    for i, l in enumerate(linhas):
-        if l.lstrip().startswith(("$", "→", "←", ">")):
-            corte = i + 1
-    resposta = "\n".join(linhas[corte:]).strip() or saida
-    return lib.truncate(lib.clean(resposta))
+    resposta = tirar_rodape_do_modelo(extrair_resposta(saida))
+    if resposta:
+        return (resposta, None, None)
+
+    erro = extrair_erro(saida)
+    if erro:
+        return (None, erro, None)
+
+    # Rede de segurança: se o opencode mudar o formato dos eventos, sair calado
+    # seria a pior falha possível aqui — canal mudo é exatamente o defeito que
+    # este modo existe para evitar. Então cai para a saída crua, só sem os
+    # escapes ANSI, que é feio mas legível.
+    print("AVISO: nenhum evento 'text' nem 'error' no JSON do opencode — "
+          "devolvendo a saída crua", file=sys.stderr)
+    return (None, None, ANSI.sub("", saida).strip() or None)
+
+
+def responder(texto):
+    """Roda o opencode e devolve a resposta dele, já limpa de segredo.
+
+    Tenta o modelo principal e, se a API recusar, cai para as reservas. A troca é
+    por PEDIDO e não permanente de propósito: a falha observada foi transitória
+    do upstream, e fixar a reserva deixaria a Unity num modelo pior depois que o
+    principal já voltou.
+    """
+    # Uma vez só: `continuar_conversa` grava estado, e chamá-la por tentativa
+    # reiniciaria o relógio de validade da sessão a cada reserva.
+    continuar = continuar_conversa()
+    prazo = time.time() + TIMEOUT_RESPOSTA
+    ultimo_erro = None
+
+    for tentativa, modelo in enumerate([MODELO] + MODELOS_RESERVA):
+        restante = int(prazo - time.time())
+        if tentativa and restante < MINIMO_PARA_RESERVA:
+            print(f"sem tempo para a reserva {modelo} ({restante}s restantes)",
+                  file=sys.stderr)
+            break
+
+        resposta, erro, cru = _rodar(texto, modelo, continuar,
+                                     max(restante, MINIMO_PARA_RESERVA))
+        if resposta:
+            if tentativa:
+                print(f"respondido pela reserva {modelo}", file=sys.stderr)
+            return lib.truncate(lib.clean(resposta))
+        if cru:
+            return lib.truncate(lib.clean(cru))
+
+        ultimo_erro = erro
+        if erro[0] == TIMEOUT:
+            return (f"⏳ Demorei demais ({erro[1]}s) e cortei. "
+                    "Tenta pedir menor?")
+        http = f" HTTP {erro[1]}" if erro[1] else ""
+        print(f"modelo {modelo} falhou:{http} {erro[0]}", file=sys.stderr)
+
+    mensagem, http = ultimo_erro or ("motivo desconhecido", None)
+    if http == 402:
+        # 402 aqui é saldo do upstream do opencode zen, não conta do dono: dizer
+        # "sem saldo" seco mandaria ele procurar cartão que não é o problema.
+        return ("🔴 Os modelos grátis do opencode estão recusando agora "
+                f"(HTTP 402: {mensagem}). É saldo do provedor deles, não seu — "
+                "costuma voltar sozinho. Tenta de novo em alguns minutos.")
+    return ("🔴 Não consegui responder: nenhum modelo do opencode atendeu "
+            f"({mensagem}{f' / HTTP {http}' if http else ''}).")
 
 
 def sincronizar_offset():
@@ -195,9 +447,9 @@ def main():
 
     lib.send_telegram(
         "⚡ Unity em modo econômico — a cota do Claude acabou, estou rodando no "
-        "DeepSeek. Mais lenta, e sem despachar pro Claude. Gemini continua "
+        "DeepSeek. Mais lenta, e sem delegar pro Claude. Gemini continua "
         "funcionando normal. Volto ao normal sozinha quando a janela zerar.",
-        silent=False)
+        silent=False, rodape=True)
 
     while True:
         try:
@@ -221,7 +473,7 @@ def main():
                 print(f"ignorando chat não autorizado: {chat}", file=sys.stderr)
                 continue
             try:
-                lib.send_telegram(responder(texto), silent=False)
+                lib.send_telegram(responder(texto), silent=False, rodape=True)
             except Exception as exc:
                 print(f"falha ao responder: {exc}", file=sys.stderr)
 

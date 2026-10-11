@@ -6,7 +6,7 @@ background_tasks) e manda um aviso curto.
 
 REGRA CRÍTICA: sai SEMPRE com 0, e SEMPRE rápido. O Stop é um hook que bloqueia
 — exit != 0 impede o Claude de encerrar o turno, e demora aqui é demora que o
-dono sente em toda sessão. Por isso o trabalho pesado (chamar a DeepSeek) roda
+O dono sente em toda sessão. Por isso o trabalho pesado (chamar a DeepSeek) roda
 num processo DESTACADO: o hook enfileira e volta na hora.
 
 Por que resumir com LLM em vez de só mandar o texto: a resposta final de uma
@@ -115,8 +115,14 @@ def resumir(texto):
             with urllib.request.urlopen(req, timeout=TIMEOUT_LLM) as resp:
                 dados = json.loads(resp.read())
             saida = (dados["choices"][0]["message"]["content"] or "").strip()
-            if saida:
+            # A INSTRUCAO já pede português, e mesmo assim em 19/08/2026 saiu
+            # japonês no Telegram. Devolver None aqui faz quem chama usar o
+            # texto cru — pior de ler, mas legível, que é o que importa.
+            if saida and not lib.idioma_suspeito(saida):
                 return quebrar(limpar_markdown(saida))
+            if saida:
+                lib._registrar_idioma(saida, lib.idioma_suspeito(saida))
+                return None
         except Exception:
             return None
     return None
@@ -140,32 +146,55 @@ def worker(caminho):
     msg = payload["msg"]
     rodando = payload["rodando"]
 
+    # O caminho determinístico é calculado SEMPRE, mesmo quando o resumo por LLM
+    # dá certo: ele é a alternativa que a trava de idioma do send_telegram usa
+    # se o resumo tiver escapado do português. Custa nada — é regex local.
+    corpo_cru = None
+    if msg:
+        corpo_cru = quebrar(limpar_markdown(msg))
+        if len(corpo_cru) > 700:
+            corpo_cru = corpo_cru[:700].rsplit("\n", 1)[0] + "\n…"
+
     corpo = None
     if msg:
         # Mensagem já curta não vale uma chamada de LLM: limpar basta.
         corpo = resumir(msg) if len(msg) > 400 else None
         if corpo is None:
-            corpo = quebrar(limpar_markdown(msg))
-            if len(corpo) > 700:
-                corpo = corpo[:700].rsplit("\n", 1)[0] + "\n…"
+            corpo = corpo_cru
 
-    linhas = [f"✅ {projeto}"]
-    if corpo:
-        linhas += ["", corpo]
-    if rodando:
-        linhas += ["", f"⏳ {len(rodando)} em segundo plano"]
+    def montar(c):
+        linhas = [f"✅ {projeto}"]
+        if c:
+            linhas += ["", c]
+        if rodando:
+            linhas += ["", f"⏳ {len(rodando)} em segundo plano"]
+        return "\n".join(linhas)
 
-    lib.send_telegram("\n".join(linhas))
+    lib.send_telegram(montar(corpo), rodape=True, bruto=montar(corpo_cru))
 
 
 def main():
     if len(sys.argv) > 2 and sys.argv[1] == "--worker":
         return worker(sys.argv[2])
 
-    # A sessão que É o canal do Telegram não deve notificar por aqui: o plugin
-    # já respondeu ao usuário, e o Stop mandaria a mesma mensagem de novo. O
-    # anti-spam de 15 min não resolve — ele só espaça a duplicata.
-    if os.environ.get("UNITY_NO_TELEGRAM_HOOK") == "1":
+    # Opt-IN, não opt-out. Este hook é global (~/.claude/settings.json), então
+    # roda em QUALQUER sessão do Claude Code na máquina — inclusive uma sessão
+    # interativa comum que nada tem a ver com a Unity. Medido em 04/08/2026:
+    # uma sessão interativa minha, com `cd` preso num projeto por uma tarefa
+    # anterior, vazou dois resumos pro canal da Unity marcados com o projeto
+    # errado (o basename do cwd tornou-se a "origem" só por acidente), e um
+    # deles, resumido pela DeepSeek, distorceu "proponho a correção, aplico?"
+    # em algo lido como "já corrigi" — uma alegação falsa de conserto que só
+    # confundiu mais o dono. A sessão que É o canal do Telegram já teria a
+    # trava antiga (UNITY_NO_TELEGRAM_HOOK=1); o problema é que TODA outra
+    # sessão — inclusive uma nunca pensada pra isso — notificava por padrão.
+    #
+    # Quem hoje precisa avisar sobre trabalho de fundo já o faz por conta
+    # própria: `unity-delegar` manda seu próprio Telegram (`lib.send_telegram`)
+    # assim que o subprocesso do executor termina, para claude/sonnet/gemini/
+    # opencode igualmente — nenhuma dessas faixas depende deste hook. Este
+    # hook fica então reservado para quem pedir explicitamente.
+    if os.environ.get("UNITY_NOTIFY_TELEGRAM") != "1":
         return
 
     try:

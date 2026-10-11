@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""Checagem semanal: os modelos grátis do catálogo opencode zen ainda existem?
+
+O catálogo zen ROTACIONA sem aviso — em 24/08/2026 o `deepseek-v4-flash-free`
+(modelo principal do `unity-delegar --nivel opencode` E do `unity-fallback`,
+a saída de emergência quando a cota do Claude estoura) sumiu do catálogo, e
+todo modelo que some responde `UnknownError / Unexpected server error` em
+~5s — indistinguível de queda de provedor. Ficou tudo morto sem ninguém
+perceber até faltar justo na hora do fallback.
+
+Este script testa os mesmos modelos que `unity-delegar`/`unity-fallback`
+usam hoje (principal + reservas, lidos das mesmas variáveis de ambiente, para
+nunca ficar dessincronizado se alguém trocar o modelo por lá) com uma tarefa
+real e mínima — escreve um arquivo, não só lista o catálogo por nome, porque
+foi assim que o problema de 24/08 foi encontrado e confirmado.
+
+Roda via timer semanal. Fala no Telegram só se algo estiver quebrado —
+sucesso é silencioso, para não treinar o olho a ignorar a mensagem.
+"""
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+sys.path.insert(0, "/home/reaper/.local/bin")
+
+OPENCODE = shutil.which("opencode") or os.path.expanduser("~/.opencode/bin/opencode")
+TIMEOUT_POR_MODELO = 90
+
+# 28/09/2026: estes defaults tinham envelhecido calado — `mimo-v2.5-free` saiu do
+# catálogo em 23/09 e `muse-spark-1.2` virou 1.3, então o vigia testava dois
+# modelos inexistentes e falhava toda semana (systemd status=1 em ~11s) pelo
+# motivo errado. O comentário do topo diz que ele lê "das mesmas variáveis" que o
+# `unity-delegar`, mas variável não setada cai no default — e o default aqui
+# precisa ser reconferido junto com o de lá, senão o vigia mente.
+MODELO_PRINCIPAL = os.environ.get("UNITY_OPENCODE_MODEL", "opencode/mimo-v2.6-flash-free")
+MODELOS_RESERVA = [m.strip() for m in os.environ.get(
+    "UNITY_OPENCODE_MODELOS_RESERVA",
+    "opencode/ling-3.0-flash-fin-free,opencode/muse-spark-1.3-contributor-free").split(",")]
+
+MODELOS = [MODELO_PRINCIPAL] + [m for m in MODELOS_RESERVA if m]
+
+
+def carregar_lib():
+    import importlib.util
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "unity_lib", "/home/reaper/.local/bin/unity-lib.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
+
+
+def carregar_delegar():
+    """O `unity-delegar` como módulo, para não duplicar modelo nem credencial.
+
+    Sem extensão `.py`, então precisa de loader explícito. Vale a ida: o modelo
+    do Nex e o caminho da chave da OpenRouter moram lá, e o dia em que este
+    vigia tiver a própria cópia deles é o dia em que ele passa a vigiar uma
+    configuração que ninguém usa — foi assim que os defaults daqui envelheceram
+    até 28/09/2026, testando um `mimo-v2.5-free` que não existia mais.
+    """
+    import importlib.util
+    from importlib.machinery import SourceFileLoader
+    try:
+        # `spec_from_file_location` devolve None para arquivo SEM extensão — e
+        # o `unity-delegar` não tem. O loader explícito é o que faz funcionar;
+        # sem ele esta função voltava None calada e o vigia seguia cego para o
+        # Nex, exatamente o defeito que ela veio consertar.
+        caminho = "/home/reaper/.local/bin/unity-delegar"
+        spec = importlib.util.spec_from_loader(
+            "unity_delegar", SourceFileLoader("unity_delegar", caminho))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)   # tem guarda __main__: não dispara nada
+        return mod
+    except Exception:
+        return None
+
+
+def modelos_a_checar():
+    """Os modelos que valem teste hoje: os do zen, mais o Nex se houver chave."""
+    modelos = list(MODELOS)
+    d = carregar_delegar()
+    if not d:
+        return modelos
+    try:
+        # Só entra na lista se a credencial existir. Sem ela a faixa nem tenta
+        # rodar (o despachante recusa na hora com instrução), então testá-la
+        # produziria um alarme semanal sobre algo que já se explica sozinho.
+        if getattr(d, "chave_openrouter", lambda: None)():
+            if d.MODELO_NEX not in modelos:
+                modelos.append(d.MODELO_NEX)
+    except Exception:
+        pass
+    return modelos
+
+
+def testar_modelo(modelo):
+    """Roda uma escrita de arquivo real com o modelo. (ok: bool, detalhe: str)."""
+    with tempfile.TemporaryDirectory(prefix="unity-checa-opencode-") as tmp:
+        marca = "UNITY-CHECA-OPENCODE-OK"
+        prompt = (
+            f"Write the exact text {marca} into a file named prova.txt "
+            f"in the current directory. Nothing else."
+        )
+        try:
+            env = dict(os.environ)
+            env["PATH"] = f"{Path.home()}/.local/bin:{Path.home()}/.opencode/bin:" + env.get("PATH", "")
+            if modelo.startswith("openrouter/"):
+                d = carregar_delegar()
+                chave = d.chave_openrouter() if d else None
+                if not chave:
+                    return True, "sem credencial — pulado, não é falha do modelo"
+                env["OPENROUTER_API_KEY"] = chave
+            r = subprocess.run(
+                [OPENCODE, "run", prompt, "--model", modelo, "--dir", tmp, "--auto"],
+                cwd=tmp, env=env, capture_output=True, text=True,
+                timeout=TIMEOUT_POR_MODELO,
+            )
+        except subprocess.TimeoutExpired:
+            return False, f"não terminou em {TIMEOUT_POR_MODELO}s"
+        except Exception as e:
+            return False, f"erro ao executar: {e}"
+
+        prova = Path(tmp) / "prova.txt"
+        if not prova.exists():
+            saida = (r.stdout or "") + (r.stderr or "")
+            if "UnknownError" in saida or "Unexpected server error" in saida:
+                return False, "UnknownError/Unexpected server error (modelo sumiu do catálogo)"
+            return False, f"arquivo não apareceu (rc={r.returncode})"
+        if marca not in prova.read_text(errors="ignore"):
+            return False, "arquivo apareceu mas com conteúdo errado"
+        return True, "ok"
+
+
+def main():
+    if not os.path.isfile(OPENCODE):
+        return 0  # opencode não instalado nesta máquina, nada a checar
+
+    falhas = []
+    for modelo in modelos_a_checar():
+        ok, detalhe = testar_modelo(modelo)
+        if not ok:
+            falhas.append((modelo, detalhe))
+
+    if not falhas:
+        return 0
+
+    lib = carregar_lib()
+    if lib and hasattr(lib, "send_telegram"):
+        linhas = ["🔴 Modelo opencode sumiu"]
+        for modelo, detalhe in falhas:
+            nome = modelo.split("/")[-1]
+            linhas.append(f"{nome}: {detalhe}")
+        linhas.append("")
+        linhas.append("Rode: opencode models")
+        linhas.append("e troque UNITY_OPENCODE_MODEL")
+        lib.send_telegram("\n".join(linhas), silent=False)
+
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

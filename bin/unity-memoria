@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""Consulta o ai-memory pela linha de comando, para quem não tem MCP.
+
+Por que existe: a Unity normal é uma sessão do Claude Code, e lá o ai-memory
+entra como servidor MCP — `memory_query` é uma ferramenta de verdade. A Unity em
+modo econômico roda no opencode, que aqui está SEM nenhum MCP configurado. E o
+roteamento.md, escrito para a versão Claude, mandava ela "consultar o ai-memory
+com memory_query antes de delegar": instrução para usar uma ferramenta que, no
+modo econômico, não existe.
+
+O efeito medido nos transcripts do fallback: o dono mandava "Sim", ou "quando
+terminar de arrumar o hero me manda a foto", e ela respondia "não tenho contexto
+do 'sim'" / "não tenho nenhuma tarefa de hero no meu contexto". Ele leu isso
+como a Unity não entender o pedido. Era amnésia — e sem MCP ela não tinha como
+sair dela sozinha.
+
+Este script é a ponte: fala o mesmo JSON-RPC do MCP por HTTP e imprime texto.
+Bash a Unity econômica já tem, então isto vira uma ferramenta que ela alcança.
+
+    unity-memoria "hero do site"     # busca por assunto
+    unity-memoria --recente          # o que aconteceu por último
+
+O token sai de ~/.claude.json, que já é a fonte única dele nesta máquina — de
+propósito, para não espalhar mais uma cópia do segredo por arquivo de config.
+"""
+import json
+import re
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+CLAUDE_JSON = Path.home() / ".claude.json"
+TIMEOUT = 25
+
+# Quanto de cada acerto vale a pena mostrar. O consumidor é um modelo pequeno com
+# contexto curto respondendo no Telegram: despejar a sessão inteira gastaria o
+# contexto que ele precisa para RESPONDER. Título mais um trecho bastam para ele
+# reconhecer o assunto e continuar a conversa.
+LIMITE_TRECHO = 300
+
+
+def endpoint():
+    """Devolve (url, header de Authorization) do ai-memory."""
+    try:
+        cfg = json.loads(CLAUDE_JSON.read_text())["mcpServers"]["ai-memory"]
+    except Exception as exc:
+        raise SystemExit(f"não achei a config do ai-memory em {CLAUDE_JSON}: {exc}")
+    return cfg["url"], cfg["headers"]["Authorization"]
+
+
+def chamar(ferramenta, argumentos):
+    url, auth = endpoint()
+    corpo = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                        "params": {"name": ferramenta, "arguments": argumentos}}).encode()
+    req = urllib.request.Request(url, data=corpo, method="POST", headers={
+        "Authorization": auth,
+        "Content-Type": "application/json",
+        # O servidor é MCP sobre HTTP e recusa quem não declara aceitar SSE,
+        # mesmo quando a resposta vem como JSON simples.
+        "Accept": "application/json, text/event-stream",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+            resposta = json.loads(r.read().decode())
+    except urllib.error.URLError as exc:
+        raise SystemExit(f"ai-memory não respondeu ({exc}). O container está de pé?")
+
+    if "error" in resposta:
+        raise SystemExit(f"ai-memory recusou: {resposta['error'].get('message')}")
+
+    # O resultado útil vem como texto JSON dentro do envelope do MCP.
+    for parte in resposta.get("result", {}).get("content", []):
+        if parte.get("type") == "text":
+            try:
+                return json.loads(parte["text"])
+            except Exception:
+                return {"texto": parte["text"]}
+    return {}
+
+
+# Cabeçalho que toda página de sessão carrega: o título repetido e o bloco de
+# `session_id` / `started_at` / `ended_at`. Não diz NADA sobre o assunto e, em
+# `--recente`, ocupava o trecho inteiro — o modelo pequeno lia cinco linhas de
+# UUID e continuava sem saber do que estavam falando.
+RUIDO = re.compile(
+    r"##\s*Session metadata.*?(?=##|$)"
+    r"|\*\*(?:session_id|started_at|ended_at|project|workspace):\*\*\s*`?[^`\n]*`?"
+    r"|`session-start`[^\n]*",
+    re.S)
+
+
+def limpar(s):
+    """Tira destaque do buscador e metadata de sessão, e achata em uma linha."""
+    s = (s or "").replace("<mark>", "").replace("</mark>", "")
+    return " ".join(RUIDO.sub(" ", s).split())
+
+
+def mostrar(dados, quantos):
+    hits = dados.get("hits")
+    if hits is None:
+        print(dados.get("texto") or json.dumps(dados)[:1000])
+        return
+    if not hits:
+        print("nada no ai-memory sobre isso.")
+        return
+    for h in hits[:quantos]:
+        titulo = limpar(h.get("title"))
+        if not titulo:
+            # Página sem título rende um marcador vazio, que só faz o modelo
+            # gastar linha achando que perdeu alguma coisa.
+            continue
+        print(f"• {titulo[:120]}")
+        # Toda página de sessão abre repetindo o título como `# título`. Depois
+        # de tirar a metadata, em `--recente` sobra exatamente isso — imprimir
+        # seria a mesma linha duas vezes, gastando o contexto curto do modelo.
+        trecho = limpar(h.get("snippet")).lstrip("# ")
+        if trecho.rstrip("…").strip() and not trecho.startswith(titulo.rstrip("…")[:60]):
+            print(f"  {trecho[:LIMITE_TRECHO]}")
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        raise SystemExit(__doc__)
+
+    if args[0] in ("--recente", "--recentes"):
+        quantos = int(args[1]) if len(args) > 1 else 5
+        mostrar(chamar("memory_recent", {"limit": quantos}), quantos)
+        return
+
+    quantos = 5
+    mostrar(chamar("memory_query", {"query": " ".join(args)}), quantos)
+
+
+if __name__ == "__main__":
+    main()

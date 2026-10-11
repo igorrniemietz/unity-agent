@@ -3,9 +3,9 @@
 
 POR QUE EXISTE (medido em 2026-08-01)
 
-O plugin do Telegram entrega o texto do Igor dentro de um envelope XML:
+O plugin do Telegram entrega o texto do dono dentro de um envelope XML:
 
-    <channel source="plugin:telegram:telegram" chat_id="SEU_CHAT_ID"
+    <channel source="plugin:telegram:telegram" chat_id="SEU_ID_DO_TELEGRAM"
              message_id="97" user="..." ts="...">
     cria pra mim um monitoramento de tokens do agente orquestrador
     </channel>
@@ -15,7 +15,7 @@ página da sessão com os ~80 primeiros caracteres do primeiro prompt — ou sej
 o corte cai SEMPRE dentro da tag e o texto humano nunca aparece. Todas as
 páginas de sessão do projeto ficaram tituladas assim:
 
-    <channel source="plugin:telegram:telegram" chat_id="SEU_CHAT_ID"…
+    <channel source="plugin:telegram:telegram" chat_id="SEU_ID_DO_TELEGRAM"…
 
 Isso estraga duas coisas de uma vez:
 
@@ -27,7 +27,7 @@ Isso estraga duas coisas de uma vez:
    conteúdo. O envelope não só não ajuda — ele afoga o índice.
 
 O conserto certo seria no ai-memory, mas ele é uma imagem Docker de terceiro.
-Então desembrulhamos aqui, no caminho do hook, que é código do Igor.
+Então desembrulhamos aqui, no caminho do hook, que é código do dono.
 
 REGRA DE OURO: este script está no caminho de TODO evento de hook. Se ele
 falhar, o evento tem de passar mesmo assim, intacto. Nenhuma exceção sobe, e o
@@ -45,7 +45,7 @@ import sys
 AI_MEMORY = "/home/reaper/.local/bin/ai-memory"
 DATA_DIR = "/home/reaper/.local/share/ai-memory"
 
-# Casa o envelope inteiro e captura o miolo. DOTALL porque o texto do Igor tem
+# Casa o envelope inteiro e captura o miolo. DOTALL porque o texto do dono tem
 # quebra de linha; non-greedy para não engolir dois envelopes numa tacada.
 ENVELOPE = re.compile(r"<channel\s+([^>]*)>\s*(.*?)\s*</channel>", re.DOTALL)
 FONTE = re.compile(r'source="plugin:([^:"]+)')
@@ -98,4 +98,4 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except Exception:
-        sys.exit(0)  # hook quebrado não pode derrubar a sessão do Igor
+        sys.exit(0)  # hook quebrado não pode derrubar a sessão do dono

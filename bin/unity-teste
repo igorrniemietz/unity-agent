@@ -1,0 +1,622 @@
+#!/usr/bin/env python3
+"""Bateria de testes da Unity. Roda sozinho, sem pedir nada ao dono.
+
+    unity-teste              # tudo, incluindo um envio real no Telegram
+    unity-teste --silencioso # pula o envio real (nao apita o celular)
+
+Cada teste imprime PASSA/FALHA e o porquê. Saída != 0 se algo falhou.
+
+O que ele NÃO consegue testar sozinho, e por quê: a perna "Telegram → sessão
+dela". O servidor do canal lê a fila da Bot API, e um bot não consegue mandar
+mensagem para si mesmo — não há como forjar uma entrada. Essa perna é a única
+que precisa de uma mensagem de verdade. Tudo do outro lado dela é coberto aqui.
+"""
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+BIN = Path.home() / ".local/bin"
+HOME = Path.home()
+falhas = []
+ok = []
+
+
+def passa(nome, detalhe=""):
+    ok.append(nome)
+    print(f"  \033[32mPASSA\033[0m  {nome}" + (f"  ({detalhe})" if detalhe else ""))
+
+
+def falha(nome, motivo):
+    falhas.append((nome, motivo))
+    print(f"  \033[31mFALHA\033[0m  {nome}\n         → {motivo}")
+
+
+def sh(cmd, timeout=40):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout, r.stderr
+    except Exception as exc:
+        return 1, "", str(exc)
+
+
+def secao(t):
+    print(f"\n\033[1m{t}\033[0m")
+
+
+# ── 1. Está viva? ───────────────────────────────────────────────────────────
+def t_viva():
+    secao("1. Ela está de pé")
+    n = subprocess.run("ps -eo args | grep -c '[s]erver[.]ts'", shell=True,
+                       capture_output=True, text=True).stdout.strip()
+    if n and int(n) >= 1:
+        passa("servidor do canal rodando", f"{n} processo(s)")
+    else:
+        falha("servidor do canal rodando",
+              "nenhum server.ts. Sem ele o Telegram nao chega nela. "
+              "Rode: unity-ensure")
+
+    rc, out, _ = sh(["claude", "agents", "--json"])
+    try:
+        agentes = json.loads(out)
+    except Exception:
+        agentes = []
+    dela = [a for a in agentes if a.get("id") and a.get("cwd") == str(HOME)]
+    if dela:
+        passa("sessao de fundo dela viva", f"{dela[0]['id']} · {dela[0].get('status')}")
+    else:
+        falha("sessao de fundo dela viva",
+              "nenhuma sessao de fundo em $HOME. Rode: unity-ensure")
+
+
+# ── 2. Permissões ───────────────────────────────────────────────────────────
+def t_permissoes():
+    secao("2. Permissões (o que ja travou ela em silencio antes)")
+    try:
+        d = json.loads((HOME / ".claude/supervisor-settings.json").read_text())
+    except Exception as exc:
+        falha("ler supervisor-settings.json", str(exc))
+        return
+    allow = d.get("permissions", {}).get("allow", [])
+    for f in ("ListAgents", "SendMessage", "Bash",
+              "mcp__plugin_telegram_telegram__reply"):
+        if f in allow:
+            passa(f"{f} liberado")
+        else:
+            falha(f"{f} liberado",
+                  f"fora da allow. Em sessao de fundo isso vira 'blocked' "
+                  f"silencioso — ela fica muda sem erro.")
+
+    if d.get("crossSessionInbound") == "accept":
+        passa("crossSessionInbound=accept", "mensagem de outra sessao entra direto")
+    else:
+        falha("crossSessionInbound=accept",
+              f"esta {d.get('crossSessionInbound')!r}; no default a mensagem "
+              f"fica retida esperando aprovacao e expira sozinha")
+
+    if d.get("enabledPlugins", {}).get("vercel@claude-plugins-official") is False:
+        passa("Vercel desligado pra ela", "mantem o reply fora do grupo adiado")
+    else:
+        falha("Vercel desligado pra ela",
+              "herdado do settings global; incha a superficie e forca um "
+              "ToolSearch (~6s) antes de cada resposta")
+
+
+# ── 3. Hooks, alimentados com payload de verdade ────────────────────────────
+def t_hooks():
+    secao("3. Travas (testadas com payload, nao por inspecao)")
+
+    # 3a. idioma
+    pl = json.dumps({"tool_name": "mcp__plugin_telegram_telegram__reply",
+                     "tool_input": {"chat_id": "1",
+                                    "text": "テストです。これは日本語のメッセージ"}})
+    r = subprocess.run([str(BIN / "unity-guarda-idioma")], input=pl,
+                       capture_output=True, text=True)
+    if '"deny"' in r.stdout:
+        passa("trava de idioma barra japones")
+    else:
+        falha("trava de idioma barra japones", f"nao bloqueou (saida: {r.stdout[:80]!r})")
+
+    pl_ok = json.dumps({"tool_name": "mcp__plugin_telegram_telegram__reply",
+                        "tool_input": {"chat_id": "1", "text": "Tudo certo por aqui."}})
+    r = subprocess.run([str(BIN / "unity-guarda-idioma")], input=pl_ok,
+                       capture_output=True, text=True)
+    # Depois da fusao, portugues PRODUZ saida (o rodape). O que nao pode
+    # acontecer e ser NEGADO — a assercao antiga ("saida vazia") virou falso
+    # negativo assim que o hook passou a colar rodape.
+    negado = False
+    try:
+        negado = json.loads(r.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
+    except Exception:
+        negado = False
+    if not negado:
+        passa("trava de idioma deixa portugues passar")
+    else:
+        falha("trava de idioma deixa portugues passar",
+              "bloqueou texto legitimo — ela ficaria muda")
+
+    # 3b. exige resposta
+    with tempfile.TemporaryDirectory() as td:
+        mudo = Path(td) / "mudo.jsonl"
+        mudo.write_text("\n".join(json.dumps(x) for x in [
+            {"type": "user", "message": {"content":
+                '<channel source="plugin:telegram:telegram" chat_id="1">\noi\n</channel>'}},
+            {"type": "assistant", "message": {"content":
+                [{"type": "text", "text": "resposta que ficou so no terminal"}]}},
+        ]))
+        pl = json.dumps({"session_id": f"teste-{time.time()}",
+                         "transcript_path": str(mudo)})
+        r = subprocess.run([str(BIN / "unity-exige-resposta")], input=pl,
+                           capture_output=True, text=True)
+        if '"block"' in r.stdout:
+            passa("trava do 'so o emote' barra turno mudo")
+        else:
+            falha("trava do 'so o emote' barra turno mudo",
+                  "deixou fechar sem responder — o bug volta")
+
+        respondeu = Path(td) / "ok.jsonl"
+        respondeu.write_text("\n".join(json.dumps(x) for x in [
+            {"type": "user", "message": {"content":
+                '<channel source="plugin:telegram:telegram" chat_id="1">\noi\n</channel>'}},
+            {"type": "assistant", "message": {"content":
+                [{"type": "tool_use", "name": "mcp__plugin_telegram_telegram__reply",
+                  "input": {}}]}},
+        ]))
+        pl = json.dumps({"session_id": f"teste2-{time.time()}",
+                         "transcript_path": str(respondeu)})
+        r = subprocess.run([str(BIN / "unity-exige-resposta")], input=pl,
+                           capture_output=True, text=True)
+        if not r.stdout.strip():
+            passa("trava do 'so o emote' libera quem respondeu")
+        else:
+            falha("trava do 'so o emote' libera quem respondeu",
+                  "bloquearia turno correto — laco infinito")
+
+    # 3b-bis. O teto e por TURNO? (na v1 era por sessao, e uma mensagem antiga
+    #         sem resposta consumia a cota de todas as seguintes — a trava
+    #         virava enfeite depois do segundo tropeco.)
+    with tempfile.TemporaryDirectory() as td:
+        base = [
+            {"type": "user", "timestamp": "2026-01-01T10:00:00Z", "message": {"content":
+                '<channel source="plugin:telegram:telegram" chat_id="1">\nprimeira\n</channel>'}},
+            {"type": "assistant", "message": {"content":
+                [{"type": "tool_use", "name": "mcp__plugin_telegram_telegram__reply",
+                  "input": {}}]}},
+            {"type": "user", "timestamp": "2026-01-01T10:05:00Z", "message": {"content":
+                '<channel source="plugin:telegram:telegram" chat_id="1">\nsegunda\n</channel>'}},
+            {"type": "assistant", "message": {"content":
+                [{"type": "text", "text": "presa no terminal"}]}},
+        ]
+        arq = Path(td) / "turnos.jsonl"
+        arq.write_text("\n".join(json.dumps(x) for x in base))
+        sess = f"tetoturno-{time.time()}"
+        vereditos = []
+        for _ in range(2):
+            r = subprocess.run([str(BIN / "unity-exige-resposta")],
+                               input=json.dumps({"session_id": sess,
+                                                 "transcript_path": str(arq)}),
+                               capture_output=True, text=True)
+            vereditos.append('"block"' in r.stdout)
+        if all(vereditos):
+            passa("teto e por turno, nao por sessao",
+                  "mensagem nova recupera as 2 tentativas")
+        else:
+            falha("teto e por turno, nao por sessao",
+                  f"parou de insistir cedo demais ({vereditos}) — turno antigo "
+                  f"esta gastando a cota do novo")
+
+    # 3d. rodape de custo colado pelo hook (sem custar turno do modelo)
+    pl = json.dumps({"tool_name": "mcp__plugin_telegram_telegram__reply",
+                     "tool_input": {"chat_id": "1", "text": "Corrigido."}})
+    r = subprocess.run([str(BIN / "unity-guarda-idioma")], input=pl,
+                       capture_output=True, text=True)
+    try:
+        novo_texto = json.loads(r.stdout)["hookSpecificOutput"]["updatedInput"]["text"]
+    except Exception:
+        novo_texto = ""
+    if "📊 Claude" in novo_texto:
+        passa("rodape de custo colado automaticamente",
+              novo_texto.splitlines()[-1][:34])
+    else:
+        falha("rodape de custo colado automaticamente",
+              f"nao veio rodape (saida: {r.stdout[:90]!r})")
+
+    pl = json.dumps({"tool_name": "mcp__plugin_telegram_telegram__reply",
+                     "tool_input": {"chat_id": "1", "text": "x\n\n📊 Claude 9% 5h"}})
+    r = subprocess.run([str(BIN / "unity-guarda-idioma")], input=pl,
+                       capture_output=True, text=True)
+    if not r.stdout.strip():
+        passa("rodape nao duplica quando ela ja colou")
+    else:
+        falha("rodape nao duplica quando ela ja colou",
+              "colaria dois rodapes na mesma mensagem")
+
+    # 3e. limite do Telegram: 4096 e o teto duro da Bot API. Mensagem longa +
+    #     rodape tem que continuar entregavel — o plugin divide por linha.
+    longo = ("linha de teste com tamanho realista de resposta\n" * 90)[:4050]
+    pl = json.dumps({"tool_name": "mcp__plugin_telegram_telegram__reply",
+                     "tool_input": {"chat_id": "1", "text": longo}})
+    r = subprocess.run([str(BIN / "unity-guarda-idioma")], input=pl,
+                       capture_output=True, text=True)
+    try:
+        t = json.loads(r.stdout)["hookSpecificOutput"]["updatedInput"]["text"]
+    except Exception:
+        t = ""
+    if t and "📊 Claude" in t and "\n" in t[4000:4200]:
+        passa("mensagem longa: rodape colado em ponto divisivel",
+              f"{len(t)} chars, o plugin quebra por linha")
+    elif t and "📊 Claude" in t:
+        passa("mensagem longa: rodape colado", f"{len(t)} chars")
+    else:
+        falha("mensagem longa: rodape colado", "hook engasgou com texto no limite")
+
+    # 3c. o hook esta REGISTRADO? (passar no teste isolado nao adianta se
+    #     ninguem chama ele)
+    try:
+        d = json.loads((HOME / ".claude/supervisor-settings.json").read_text())
+        cmds = [hk.get("command", "") for e in d.get("hooks", {}).get("Stop", [])
+                for hk in e.get("hooks", [])]
+        if any("unity-exige-resposta" in c for c in cmds):
+            passa("trava do 'so o emote' registrada no Stop dela")
+        else:
+            falha("trava do 'so o emote' registrada no Stop dela",
+                  "o script existe mas nenhum hook chama ele")
+    except Exception as exc:
+        falha("trava do 'so o emote' registrada", str(exc))
+
+    try:
+        # Le o settings DELA, nao o global. `--settings` substitui os hooks
+        # globais em vez de mesclar, entao hook no global e hook inerte para a
+        # Unity — foi assim que a trava de idioma ficou 2 dias sem valer nada,
+        # com este teste passando o tempo todo.
+        g = json.loads((HOME / ".claude/supervisor-settings.json").read_text())
+        cmds = [hk.get("command", "") for e in g.get("hooks", {}).get("PreToolUse", [])
+                for hk in e.get("hooks", [])]
+        if any("unity-guarda-idioma" in c for c in cmds):
+            passa("trava de idioma registrada no PreToolUse")
+        else:
+            falha("trava de idioma registrada no PreToolUse",
+                  "o script existe mas nenhum hook chama ele")
+        # UM hook so nesta ferramenta: com dois, o segundo nao era honrado.
+        # So os hooks do matcher do REPLY. Contar todos os "unity-*" do
+        # PreToolUse pegava junto o unity-block-delete (matcher Bash) e dava
+        # falso negativo.
+        do_reply = [hk.get("command", "")
+                    for e in g.get("hooks", {}).get("PreToolUse", [])
+                    if e.get("matcher") == "mcp__plugin_telegram_telegram__reply"
+                    for hk in e.get("hooks", [])]
+        if len(do_reply) == 1 and "unity-guarda-idioma" in do_reply[0]:
+            passa("um unico hook no reply", "idioma + rodape no mesmo script")
+        else:
+            falha("um unico hook no reply",
+                  f"encadeamento com {len(do_reply)}: o segundo hook do mesmo "
+                  f"matcher e ignorado (medido: 0 de 4 respostas com rodape)")
+    except Exception as exc:
+        falha("trava de idioma registrada", str(exc))
+
+
+# ── 4. Comandos que ela usa pra responder ───────────────────────────────────
+def t_comandos():
+    secao("4. Comandos que ela chama")
+    for nome, args, esperado in (
+        # "sessao" NAO serve como agulha: a saida normal diz "2 sessoes ativas",
+        # e "sessao" nao e substring de "sessoes". Falso negativo na 1a rodada.
+        ("unity-sessoes", [str(BIN / "unity-sessoes")], "🧭"),
+        ("unity-uso --linha", [str(BIN / "unity-uso"), "--linha"], "Claude"),
+        ("unity-delegar --lista", [str(BIN / "unity-delegar"), "--lista"], None),
+    ):
+        rc, out, err = sh(args)
+        if rc == 0 and (esperado is None or esperado.lower() in out.lower()):
+            passa(nome, out.strip().splitlines()[0][:46] if out.strip() else "")
+        else:
+            falha(nome, f"rc={rc} {(err or out)[:110]}")
+
+
+# ── 5. Timers ───────────────────────────────────────────────────────────────
+def t_timers():
+    secao("5. Automações no ar")
+    rc, out, _ = sh(["systemctl", "--user", "list-timers", "unity-*",
+                     "--no-pager", "--no-legend"])
+    ativos = {l.split()[-1].replace(".service", "") for l in out.splitlines() if l.strip()}
+    for t in ("unity-supervisor", "unity-heartbeat", "unity-handoff-vigia"):
+        if any(t in a for a in ativos):
+            passa(f"{t}.timer ativo")
+        else:
+            falha(f"{t}.timer ativo", "desligado — rode: systemctl --user enable --now "
+                                      f"{t}.timer")
+
+
+# ── 5b. Queima de token ─────────────────────────────────────────────────────
+def t_queima():
+    """Em 20/08/2026 a Unity ociosa consumiu metade da cota de 5h. Causa: o
+    auto-updater do CLI reiniciava o daemon a cada 10-18 min (306 eventos em
+    24h), o daemon levava a sessao dela junto, e o unity-ensure a retomava com
+    `--resume` reenviando um transcript de 3,2 MB (~800 mil tokens). Nenhum dos
+    tres sintomas aparecia como erro em lugar nenhum."""
+    secao("5b. Queima silenciosa de token")
+
+    try:
+        d = json.loads((HOME / ".claude/settings.json").read_text())
+    except Exception as exc:
+        falha("ler settings.json", str(exc)); return
+    if d.get("autoUpdates") is False or \
+            (d.get("env") or {}).get("DISABLE_AUTOUPDATER") == "1":
+        passa("auto-update desligado", "cada upgrade derruba o daemon e a sessao")
+    else:
+        falha("auto-update desligado",
+              "ligado: cada 'cause=upgrade' reinicia o daemon, mata a sessao "
+              "dela e forca um --resume caro. Ponha autoUpdates:false")
+
+    # Taxa de renascimento. O normal e ~1/h (o ceifador de ociosidade).
+    log = HOME / ".local/share/unity-supervisor/ensure.log"
+    try:
+        linhas = log.read_text(errors="replace").splitlines()[-400:]
+    except Exception:
+        linhas = []
+    corte = time.strftime("%Y-%m-%dT%H", time.localtime(time.time() - 3600))
+    recentes = [l for l in linhas
+                if ("RETOMADO" in l or "recriado" in l) and l[:13] >= corte]
+    if len(recentes) <= 5:
+        passa("taxa de renascimento sa", f"{len(recentes)} na ultima hora")
+    else:
+        falha("taxa de renascimento sa",
+              f"{len(recentes)} renascimentos na ultima hora — algo esta "
+              f"matando a sessao em laco. Veja 'cause=' em ~/.claude/daemon.log")
+
+    # Transcript vivo abaixo do teto de retomada.
+    rc, out, _ = sh(["claude", "agents", "--json"])
+    try:
+        agentes = json.loads(out)
+    except Exception:
+        agentes = []
+    for a in agentes:
+        if not a.get("id"):
+            continue
+        f = HOME / ".claude/projects/-home-reaper" / f"{a['sessionId']}.jsonl"
+        kb = (f.stat().st_size // 1024) if f.exists() else 0
+        # Sessao VIVA cresce naturalmente; o teto decide na RETOMADA, nao
+        # durante. Passar de 500 KB so significa "a proxima retomada nasce
+        # limpa", que e o comportamento certo. Falha de verdade e passar MUITO
+        # do teto, que indica que ninguem esta descartando nada.
+        if kb <= 500:
+            passa("transcript dela abaixo do teto", f"{kb} KB de 500 KB")
+        elif kb <= 1500:
+            passa("transcript acima do teto, descarte previsto",
+                  f"{kb} KB — a proxima retomada nasce limpa")
+        else:
+            falha("transcript sob controle",
+                  f"{kb} KB, 3x o teto — o descarte nao esta acontecendo; "
+                  f"cada retomada reenvia isso inteiro")
+        break
+
+
+# ── 5c. Continuidade de quem nasce limpa ────────────────────────────────────
+def t_continuidade():
+    """Desde o teto de tamanho (20/08/2026), a Unity nasce SEM transcript com
+    frequência. O que substitui o contexto é o handoff que o ai-memory entrega
+    no SessionStart — e ele só existe se alguém gravar no momento do descarte."""
+    secao("5c. Continuidade da sessão que nasce limpa")
+
+    txt = (BIN / "unity-handoff-vigia").read_text(errors="replace")
+    if "--forcar" in txt:
+        passa("vigia sabe gravar handoff sob demanda")
+    else:
+        falha("vigia sabe gravar handoff sob demanda",
+              "sem --forcar, o descarte do transcript vira amnesia")
+
+    ens = (BIN / "unity-ensure").read_text(errors="replace")
+    if "--forcar" in ens and "transcript_grande_demais" in ens:
+        passa("unity-ensure grava handoff antes de descartar")
+    else:
+        falha("unity-ensure grava handoff antes de descartar",
+              "ele descarta transcript grande mas nao salva nada — a sessao "
+              "nova nasce sem saber de onde veio")
+
+    if "RETOMAR_TAMANHO_MAX" in ens:
+        passa("teto de TAMANHO no --resume",
+              "teto de idade sozinho nao segura laco de respawn")
+    else:
+        falha("teto de TAMANHO no --resume",
+              "so ha teto de idade; um laco mantem o transcript sempre fresco "
+              "enquanto ele engorda")
+
+
+# ── 5d. Aviso de "ainda trabalhando" ────────────────────────────────────────
+def t_heartbeat_sessao():
+    """O dono: 'antes de eu desabilitá-la ela avisava a cada 5min que estava
+    executando algo até mandar de fato, pra eu entender que está rodando ou
+    travada'. Dois ramos, e o segundo é o que ele mais quer."""
+    secao("5d. Aviso de trabalho em andamento")
+    import importlib.machinery, importlib.util, os
+    try:
+        ld = importlib.machinery.SourceFileLoader("hb", str(BIN / "unity-heartbeat"))
+        sp = importlib.util.spec_from_loader("hb", ld)
+        m = importlib.util.module_from_spec(sp); ld.exec_module(m)
+    except Exception as exc:
+        falha("carregar unity-heartbeat", str(exc)); return
+
+    SID = "FAKEHB01-0000-0000-0000-000000000000"
+    alvo = HOME / ".claude/projects/-home-reaper" / f"{SID}.jsonl"
+    inicio = time.time() - 8 * 60
+    m.sessao_da_unity = lambda: {"id": "FAKEHB01", "status": "busy",
+                                 "cwd": str(HOME), "sessionId": SID}
+    m.contexto_do_turno = lambda sid: (inicio, "tarefa de teste", "Bash")
+
+    class LibFalsa:
+        def __init__(self): self.msgs = []
+        def send_telegram(self, t, **k): self.msgs.append(t); return True
+
+    salvo = m.ESTADO_SESSAO.read_text() if m.ESTADO_SESSAO.exists() else None
+    try:
+        alvo.parent.mkdir(parents=True, exist_ok=True)
+        alvo.write_text("{}\n")
+        marca = f"{SID}:{int(inicio)}"
+        mt = alvo.stat().st_mtime
+
+        m.ESTADO_SESSAO.write_text(json.dumps(
+            {"marca": marca, "ultimo": time.time()-400, "mtime": mt-120}))
+        lf = LibFalsa(); m.avisar_sessao(lf)
+        if lf.msgs and "Ainda trabalhando" in lf.msgs[0]:
+            passa("avisa que esta trabalhando", lf.msgs[0].splitlines()[0])
+        else:
+            falha("avisa que esta trabalhando",
+                  "silencio durante trabalho longo — ele nao sabe se roda ou morreu")
+
+        os.utime(alvo, (time.time()-420, time.time()-420))
+        mt2 = alvo.stat().st_mtime
+        m.ESTADO_SESSAO.write_text(json.dumps(
+            {"marca": marca, "ultimo": time.time()-400, "mtime": mt2}))
+        lf = LibFalsa(); m.avisar_sessao(lf)
+        if lf.msgs and "travada" in lf.msgs[0]:
+            passa("distingue travada de trabalhando", lf.msgs[0].splitlines()[0])
+        else:
+            falha("distingue travada de trabalhando",
+                  "sem isso, travada e trabalhando mandam a MESMA mensagem")
+
+        m.ESTADO_SESSAO.write_text(json.dumps(
+            {"marca": marca, "ultimo": time.time()-60, "mtime": mt2}))
+        lf = LibFalsa(); m.avisar_sessao(lf)
+        if not lf.msgs:
+            passa("nao repete o aviso antes de 5 min")
+        else:
+            falha("nao repete o aviso antes de 5 min",
+                  "avisaria a cada passada do timer — vira ruido")
+    finally:
+        alvo.unlink(missing_ok=True)
+        if salvo is not None: m.ESTADO_SESSAO.write_text(salvo)
+        else: m.ESTADO_SESSAO.unlink(missing_ok=True)
+
+    rc, out, _ = sh(["systemctl", "--user", "show", "unity-heartbeat.timer",
+                     "-p", "TimersMonotonic"])
+    if "2min" in out or "120s" in out or "120000000" in out:
+        passa("timer do heartbeat com granularidade fina", "2 min")
+    else:
+        falha("timer do heartbeat com granularidade fina",
+              "com timer de 5 min o PRIMEIRO aviso pode demorar 10")
+
+
+# ── 5e. Chrome nas sessões dela ─────────────────────────────────────────────
+def t_chrome():
+    """Sem --chrome as ferramentas de navegador nem existem na sessão, e ela
+    não candidata em vaga nenhuma. Em 21/08/2026 ela concluiu, errado, que era
+    limitação de sessão de fundo — era a flag faltando."""
+    secao("5e. Acesso ao navegador")
+    # A regra "navegador e trabalho dela, nunca delegado" precisa estar no
+    # roteamento.md — instrucao passada por SendMessage morre quando a sessao e
+    # reciclada, e foi assim que ela voltou a delegar em 22/08 (3 tentativas
+    # perdidas, uma de 698s).
+    rot = (HOME / ".claude/orquestrador/roteamento.md").read_text(errors="replace")
+    if "Nunca delegue" in rot and "requires permission" in rot:
+        passa("regra 'navegador nao se delega' no roteamento")
+    else:
+        falha("regra 'navegador nao se delega' no roteamento",
+              "sem ela a Unity delega trabalho de navegador e a sessao delegada "
+              "sempre falha no gate de permissao da extensao")
+
+    for nome, arq in (("unity-ensure (sessão dela)", "unity-ensure"),
+                      ("unity-delegar (candidatura)", "unity-delegar")):
+        try:
+            txt = (BIN / arq).read_text(errors="replace")
+        except Exception as exc:
+            falha(nome, str(exc)); continue
+        if "--chrome" in txt:
+            passa(f"{nome} sobe com --chrome")
+        else:
+            falha(f"{nome} sobe com --chrome",
+                  "sem a flag, mcp__claude-in-chrome__* nao existe na sessao")
+
+
+# ── 5f. Falha de delegação e inchaço ────────────────────────────────────────
+def t_delegacao_falha():
+    """21/08/2026: delegação ao Gemini morreu com erro interno, o aviso de falha
+    nunca chegou, e a Unity ficou esperando resultado que já tinha voltado.
+    Junto: o transcript dela foi a 24 MB por screenshot de navegador."""
+    secao("5f. Falha de delegação e inchaço de contexto")
+
+    txt = (BIN / "unity-delegar").read_text(errors="replace")
+    if "if not ok:" in txt and "resumir_para_telegram" in txt:
+        i_falha = txt.find("if not ok:")
+        i_resumo = txt.find("resumir_para_telegram(saida, lib)", i_falha)
+        if i_falha < i_resumo:
+            passa("aviso de falha nao depende do LLM",
+                  "erro cru vai direto; roteador em pico nao engole o aviso")
+        else:
+            falha("aviso de falha nao depende do LLM",
+                  "falha ainda passa por resumo — se o roteador falhar, o "
+                  "dono nunca sabe que a delegacao morreu")
+    else:
+        falha("aviso de falha nao depende do LLM", "ramo de falha nao encontrado")
+
+    if "resgatar_artefatos_agy" in txt:
+        passa("resgata artefato do Gemini que falhou no ultimo passo",
+              "397k tokens de trabalho ja ficaram presos assim")
+    else:
+        falha("resgata artefato do Gemini que falhou no ultimo passo",
+              "o agy nao escreve fora do brain dele; sem resgate, tarefa cara "
+              "morre com o resultado pronto e inalcancavel")
+
+    hb = (BIN / "unity-heartbeat").read_text(errors="replace")
+    if "avisar_inchaco" in hb and "TETO_VIVO" in hb:
+        passa("guarda de transcript inchado",
+              "avisa antes de virar 24 MB reenviados por turno")
+    else:
+        falha("guarda de transcript inchado",
+              "o teto do unity-ensure so age na retomada; sessao viva cresce "
+              "sem freio e cada turno reenvia tudo")
+
+
+# ── 6. Saída real no Telegram ───────────────────────────────────────────────
+def t_telegram(silencioso):
+    secao("6. Entrega real no Telegram")
+    if silencioso:
+        print("  (pulado por --silencioso)")
+        return
+    import importlib.machinery, importlib.util
+    ld = importlib.machinery.SourceFileLoader("lib", str(BIN / "unity-lib.py"))
+    sp = importlib.util.spec_from_loader("lib", ld)
+    lib = importlib.util.module_from_spec(sp); ld.exec_module(lib)
+
+    carimbo = time.strftime("%H:%M:%S")
+    if lib.send_telegram(f"🧪 Autoteste da Unity — {carimbo}\n"
+                         f"Se voce esta lendo isto, a saida\n"
+                         f"para o seu celular esta boa.", silent=True):
+        passa("mensagem entregue no seu Telegram", carimbo)
+    else:
+        falha("mensagem entregue no seu Telegram",
+              "veja ~/.local/share/unity-supervisor/telegram-falhas.log")
+
+    # anexo — a regressao do PDF de 19/08
+    with tempfile.NamedTemporaryFile(suffix=".txt", delete=False, mode="w") as f:
+        f.write("Autoteste da Unity: anexo chegou.\n")
+        tmp = f.name
+    try:
+        if lib.send_telegram_document(tmp, caption="🧪 autoteste: anexo"):
+            passa("anexo entregue", "a regressao do PDF nao voltou")
+        else:
+            falha("anexo entregue", "send_telegram_document devolveu False")
+    finally:
+        os.unlink(tmp)
+
+
+def main():
+    silencioso = "--silencioso" in sys.argv
+    print("\033[1m=== Autoteste da Unity ===\033[0m")
+    t_viva(); t_permissoes(); t_hooks(); t_comandos(); t_timers()
+    t_queima(); t_continuidade(); t_heartbeat_sessao(); t_chrome(); t_delegacao_falha()
+    t_telegram(silencioso)
+
+    print(f"\n\033[1m{len(ok)} passaram, {len(falhas)} falharam\033[0m")
+    if falhas:
+        print("\nO que consertar:")
+        for nome, motivo in falhas:
+            print(f"  • {nome}: {motivo}")
+    print("\nNao coberto por este teste: a perna Telegram → sessao dela.")
+    print("Um bot nao consegue mandar mensagem para si mesmo, entao nao da")
+    print("para forjar a entrada. Mande um 'oi' de verdade para fechar o ciclo.")
+    return 1 if falhas else 0
+
+
+raise SystemExit(main())

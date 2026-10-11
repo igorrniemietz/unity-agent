@@ -3,7 +3,7 @@
 
 Existe porque duas peças precisam do mesmo número e não podem discordar: o
 `unity-ensure`, que decide qual modo da Unity deve estar no ar, e o `unity-uso`,
-que conta para o Igor. Número divergente aqui viraria troca de modo em looping.
+que conta para o dono. Número divergente aqui viraria troca de modo em looping.
 
 Imprime `<pct_5h> <pct_7d>` em stdout. Sai com 1 se a fonte não responder —
 e quem chama DEVE tratar isso como "não sei", nunca como 0. Assumir 0 num erro

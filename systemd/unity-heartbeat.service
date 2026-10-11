@@ -1,0 +1,6 @@
+[Unit]
+Description=Avisa no Telegram o que está rodando, enquanto houver delegação ativa
+
+[Service]
+Type=oneshot
+ExecStart=/home/reaper/.local/bin/unity-heartbeat

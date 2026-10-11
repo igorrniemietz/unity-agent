@@ -1,0 +1,34 @@
+#!/usr/bin/env python3
+"""Manda um aviso curto para o canal do Telegram da Unity.
+
+Existe porque `unity-send-telegram` manda ARQUIVO e `unity-notify-telegram` é
+hook de Stop (lê payload do stdin). Faltava o caso simples: texto avulso, de
+qualquer script.
+
+    unity-avisar "texto"
+    echo "texto" | unity-avisar
+
+Sai SEMPRE 0. Aviso que falha não pode derrubar quem chamou — o registro da
+candidatura é o dado, o aviso é só o eco.
+"""
+import importlib.util
+import sys
+
+
+def main():
+    texto = " ".join(sys.argv[1:]).strip() or sys.stdin.read().strip()
+    if not texto:
+        return 0
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "unity_lib", "/home/reaper/.local/bin/unity-lib.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod.send_telegram(texto, silent=False)
+    except Exception as e:                      # noqa: BLE001
+        print(f"unity-avisar: nao enviou ({e})", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

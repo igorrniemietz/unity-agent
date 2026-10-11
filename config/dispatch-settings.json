@@ -1,0 +1,138 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "_comment_por_que_existe": [
+    "Settings do EXECUTOR despachado (unity-delegar, faixas claude e sonnet).",
+    "",
+    "MEDIDO em 2026-08-02: o executor rodava só com `--permission-mode",
+    "acceptEdits`, que aceita EDIÇÃO DE ARQUIVO sozinho e mais nada. Bash",
+    "continuava caindo no portão normal — e como o despacho é `claude -p`",
+    "(não-interativo), não existe prompt para ninguém aprovar: a chamada",
+    "simplesmente falha com 'this command requires approval'.",
+    "",
+    "O sintoma enganava: `ls`, `grep`, `git status` e `python3 --version`",
+    "passavam (a sandbox libera leitura), mas `python3 script.py` e `node -e`",
+    "não. Parecia problema de sandbox e era portão de permissão. Um executor",
+    "chegou a parar e pedir aprovação no Telegram em vez de trabalhar.",
+    "",
+    "As outras duas faixas já eram autônomas: gemini usa",
+    "--dangerously-skip-permissions e opencode usa --auto. Só a faixa do",
+    "Claude estava meio aberta.",
+    "",
+    "Aqui NÃO se usa bypassPermissions: ele pula a checagem inteira e levaria",
+    "junto o hook de exclusão, que é a única barreira que o dono quis manter.",
+    "O que abre o caminho é a lista `allow` explícita — mesma doutrina do",
+    "supervisor-settings.json."
+  ],
+  "permissions": {
+    "defaultMode": "default",
+    "allow": [
+      "Bash",
+      "Read",
+      "Write",
+      "Edit",
+      "Glob",
+      "Grep",
+      "WebFetch",
+      "WebSearch",
+      "NotebookEdit",
+      "TodoWrite",
+      "Task",
+      "Agent",
+      "Skill",
+      "ToolSearch",
+      "Monitor",
+      "BashOutput",
+      "KillShell",
+      "EnterPlanMode",
+      "ExitPlanMode"
+    ],
+    "_comment_ask": [
+      "Vazia de propósito: num `-p` não existe quem responda. 'ask' aqui não",
+      "vira proteção, vira tarefa pela metade — foi exatamente o que aconteceu."
+    ],
+    "ask": [],
+    "_comment_deny": [
+      "SÓ `Edit(caminho)`, nunca `Write(caminho)`. O CLI avisa em voz alta:",
+      "regra Write(path) 'is not matched by file permission checks' — quem",
+      "cobre TODA ferramenta que escreve arquivo é a regra Edit. Write(...) no",
+      "deny é letra morta e dá falsa sensação de barreira.",
+      "",
+      "As regras Bash aparecem em DUAS formas, `Bash(cmd *)` e `Bash(cmd:*)`.",
+      "É redundância deliberada: as duas notações circulam neste sistema (o",
+      "supervisor usa a primeira, a Unity escreveu a segunda) e um `deny` que",
+      "não casa falha em silêncio — vira falsa sensação de barreira, que é pior",
+      "que barreira nenhuma. Linha repetida é barata; buraco calado não é.",
+      "",
+      "Sudo, ssh/scp, git push, git reset --hard, vercel deploy e gh pr merge",
+      "vieram da lista que a Unity escreveu sozinha em 02/08. São a classe que",
+      "escapa da máquina ou publica para fora — um executor headless não deve",
+      "alcançá-la sem alguém olhando.",
+      "",
+      "Mesma lista do supervisor, pelos mesmos motivos: rm cai no unity-trash",
+      "(via hook), segredo não se lê, e mídia de projeto não entra em contexto",
+      "porque volta em base64 em todo turno seguinte.",
+      "",
+      "O executor NÃO herda o deny de mídia do supervisor — ele PRECISA ler",
+      "imagem às vezes (conferir render, comparar com satélite). É justamente",
+      "o trabalho que deve ficar na sessão dele, que morre no fim e leva o",
+      "contexto junto. Por isso aqui só a leitura de segredo é barrada."
+    ],
+    "deny": [
+      "Bash(rm *)",
+      "Bash(rm:*)",
+      "Bash(rmdir *)",
+      "Bash(rmdir:*)",
+      "Bash(shred *)",
+      "Bash(unlink *)",
+      "Bash(git clean *)",
+      "Bash(git clean:*)",
+      "Bash(git rm *)",
+      "Bash(git rm:*)",
+      "Bash(sudo *)",
+      "Bash(sudo:*)",
+      "Bash(su *)",
+      "Bash(su:*)",
+      "Bash(git push *)",
+      "Bash(git push:*)",
+      "Bash(git reset --hard *)",
+      "Bash(git reset --hard:*)",
+      "Bash(ssh *)",
+      "Bash(ssh:*)",
+      "Bash(scp *)",
+      "Bash(scp:*)",
+      "Bash(vercel deploy *)",
+      "Bash(vercel deploy:*)",
+      "Bash(gh pr merge *)",
+      "Bash(gh pr merge:*)",
+      "Read(/home/reaper/.ssh/**)",
+      "Edit(/home/reaper/.ssh/**)",
+      "Read(/home/reaper/**/.env)",
+      "Edit(/home/reaper/infra/**/.env)",
+      "Read(**/User Data/**)",
+      "Read(**/.credentials.json)"
+    ],
+    "disableBypassPermissionsMode": "disable"
+  },
+  "_comment_hooks": [
+    "O hook de exclusão é repetido aqui porque `--settings` vale para a sessão",
+    "do executor: sem isto ele herdaria só o global, e a proteção do rm ficaria",
+    "dependendo de qual arquivo o CLI resolveu carregar. Barrar sem alternativa",
+    "seria trocar paralisia por tarefa pela metade — o hook devolve o",
+    "unity-trash junto com a recusa."
+  ],
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/reaper/.local/bin/unity-block-delete",
+            "timeout": 15,
+            "statusMessage": "checando exclusão e segredo"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""Avisa no Telegram, de 30 em 30 min, quem esta EXECUTANDO algo agora.
+
+So manda quando ha pelo menos uma sessao ou delegacao executando de verdade.
+Sessao ociosa nao gera linha nem sequer aparece -- e sem ninguem executando o
+script fica calado, sem mandar nada. O aviso reaparece a cada 30 min enquanto
+o trabalho continuar rodando e para sozinho assim que tudo volta a ficar
+ocioso. Pedido explicito do dono: estado ocioso nao e noticia.
+
+O encerramento por inatividade e o handoff antes de encerrar ja sao cuidados
+por outra automacao (unity-handoff-vigia); este script so relata o estado
+atual, nao mexe no ciclo de vida das sessoes.
+
+    unity-sessoes-telegram             manda, se houver algo ativo
+    unity-sessoes-telegram --dry-run   imprime o que mandaria (ou "(nada a avisar)")
+"""
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+SESSOES = "/home/reaper/.local/bin/unity-sessoes"
+SPOOL = Path.home() / ".local/share/unity-orquestrador/delegacoes.jsonl"
+
+
+def morreu(r):
+    """Mesma checagem do unity-pendencias: pid vivo manda, relogio decide na
+    falta dele. Sem isto, uma delegacao que morreu sem gravar o fim (o
+    registro fica preso em 'rodando' para sempre) aparece aqui como
+    'executando' semana apos semana."""
+    pid = r.get("pid")
+    if pid:
+        try:
+            os.kill(int(pid), 0)
+            return False
+        except ProcessLookupError:
+            return True
+        except Exception:
+            return False
+    limite = (r.get("timeout") or 1800) + 120
+    return (time.time() - r.get("iniciado_em", 0)) > limite
+
+
+def carregar_lib():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "unity_lib", "/home/reaper/.local/bin/unity-lib.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def delegacoes_rodando():
+    """Ultimo estado por id no spool; devolve so quem ainda esta 'rodando'.
+
+    O spool e um append-log: o mesmo id aparece de novo quando termina. Manter
+    so a ultima entrada por id e o que separa "rodando" de "ja terminou".
+    """
+    por_id = {}
+    if not SPOOL.exists():
+        return {}
+    for linha in SPOOL.read_text().splitlines():
+        linha = linha.strip()
+        if not linha:
+            continue
+        try:
+            d = json.loads(linha)
+        except Exception:
+            continue
+        if d.get("id"):
+            por_id[d["id"]] = d
+    return {i: d for i, d in por_id.items()
+            if d.get("estado") == "rodando" and not morreu(d)}
+
+
+def humano(seg):
+    if seg is None:
+        return "?"
+    if seg < 60:
+        return f"{seg}s"
+    if seg < 3600:
+        return f"{seg // 60}min"
+    h, m = divmod(seg // 60, 60)
+    return f"{h}h{m:02d}"
+
+
+def montar():
+    try:
+        saida = subprocess.run(
+            [SESSOES, "--json"], capture_output=True, text=True, timeout=25,
+        ).stdout
+        d = json.loads(saida)
+    except Exception:
+        return "🧭 Nao consegui ler as sessoes agora."
+
+    ses = d.get("sessoes", [])
+    deleg = delegacoes_rodando()
+    dirs_com_sessao = {s.get("cwd") for s in ses}
+
+    def plural(n, um, muitos):
+        return f"{n} {um if n == 1 else muitos}"
+
+    # So entra na lista quem esta EXECUTANDO. Sessao ociosa nao gera linha
+    # nem faz o aviso disparar -- pedido explicito do dono: o alerta existe
+    # enquanto ha trabalho rodando, e some sozinho quando tudo volta a ficar
+    # ocioso (o timer de 30 min so fala se houver algo aqui).
+    executando = []
+
+    for s in ses:
+        nome = s.get("nome") or (s["cwd"].rsplit("/", 1)[-1] if s.get("cwd") else "?")
+        marca = "eu" if s.get("unity") else nome[:18]
+
+        tarefa = None
+        for dl in deleg.values():
+            if dl.get("dir") and dl.get("dir") == s.get("cwd"):
+                tarefa = (dl.get("tarefa") or "")[:40]
+                break
+
+        if tarefa:
+            executando.append(f"· {marca} — executando: {tarefa}")
+        elif s.get("status") == "busy":
+            executando.append(f"· {marca} — executando")
+
+    # Delegacao rodando cujo diretorio nao bate com nenhuma sessao listada
+    # (processo em segundo plano fora do controle do daemon de sessoes).
+    for dl in deleg.values():
+        if dl.get("dir") not in dirs_com_sessao:
+            proj = dl.get("projeto") or "?"
+            executando.append(f"· {proj} — executando: {(dl.get('tarefa') or '')[:40]}")
+
+    if not executando:
+        return None  # tudo ocioso ou nada ativo -- main() nao manda nada
+
+    cabecalho = f"🧭 {plural(len(executando), 'sessao executando', 'sessoes executando')}"
+    return "\n".join([cabecalho] + executando)
+
+
+def main():
+    texto = montar()
+    if "--dry-run" in sys.argv:
+        print(texto if texto is not None else "(nada a avisar)")
+        return 0
+    if texto is None:
+        return 0
+    lib = carregar_lib()
+    # silent=False: e um aviso periodico pedido explicitamente pelo dono, nao
+    # um relatorio passivo -- o ponto e ele saber sem precisar perguntar.
+    lib.send_telegram(texto, silent=False)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception:
+        sys.exit(0)  # timer nao pode falhar barulhento

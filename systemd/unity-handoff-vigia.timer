@@ -1,0 +1,11 @@
+[Unit]
+Description=Unity — vigia de ociosidade (1h30) a cada 10 min
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=10min
+AccuracySec=1min
+Unit=unity-handoff-vigia.service
+
+[Install]
+WantedBy=timers.target

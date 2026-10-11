@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+"""CLI script to send a file to Telegram using unity-lib.
+
+Usage:
+    unity-send-telegram <file-path> [caption]
+"""
+import importlib.util
+import sys
+from pathlib import Path
+
+
+def carregar_lib():
+    spec = importlib.util.spec_from_file_location(
+        "unity_lib", "/home/reaper/.local/bin/unity-lib.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        print("Usage: unity-send-telegram <file-path> [caption]", file=sys.stderr)
+        return 1
+
+    path_arg = sys.argv[1]
+    caption_arg = sys.argv[2] if len(sys.argv) > 2 else ""
+
+    file_path = Path(path_arg).expanduser().resolve()
+    if not file_path.is_file():
+        print(f"Error: file not found: {path_arg}", file=sys.stderr)
+        return 1
+
+    lib = carregar_lib()
+    ok = lib.send_telegram_document(str(file_path), caption_arg)
+
+    if ok:
+        print(f"Success: file '{file_path.name}' sent to Telegram.")
+        return 0
+    else:
+        print(f"Error: failed to send file '{file_path.name}' to Telegram.", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

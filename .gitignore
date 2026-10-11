@@ -6,3 +6,10 @@ projetos.md
 *.log
 despachos.jsonl
 __pycache__/
+*.pyc
+
+# Estado de sessão do Claude Code dentro do clone (worktrees, histórico local).
+.claude/
+
+# Sobra de execução de teste
+*.stderr

@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""Hook Stop: proíbe encerrar o turno com mensagem do Telegram sem resposta.
+
+O dono reclamou em 19/08/2026: "tem mensagens que eu mando que não têm resposta,
+só o emote". O 👀 é o servidor do canal reagindo sozinho ao receber — ele sai
+mesmo que a Unity nunca responda. Então silêncio total é indistinguível, do lado
+dele, de "recebi e estou pensando".
+
+A causa é antiga e conhecida (memória project_unity_reply_tool_nunca_chamado):
+ela escreve a resposta como texto final, que só aparece no terminal dela, e nunca
+chama `mcp__plugin_telegram_telegram__reply`. A persona já avisa disso em letras
+garrafais há semanas e mesmo assim acontece — porque é instrução, e instrução o
+modelo pode pular. Isto aqui é trava de ferramenta: o turno NÃO FECHA sem o
+reply.
+
+Bloquear devolve o motivo para ela e o turno continua. O dono não vê nada disso.
+"""
+import json
+import re
+import sys
+from pathlib import Path
+
+REPLY = "mcp__plugin_telegram_telegram__reply"
+CANAL = re.compile(r'<channel\s[^>]*source="plugin:telegram')
+# Teto de insistência. Sem ele, uma sessão que por qualquer motivo não CONSEGUE
+# chamar o reply (ferramenta fora da allow, canal caído) entraria em laço
+# infinito de bloqueio — trocando "mudo" por "travado", que é pior.
+# Duas insistências e, na terceira, o hook ENTREGA no lugar dela.
+#
+# A v1 só insistia, com teto por SESSÃO — e em 19/08/2026 falhou exatamente
+# assim: bloqueou 2x, a Unity mesmo assim não chamou o reply, o teto zerou a
+# trava para o resto da sessão e o dono ficou sem resposta de novo. Duas lições:
+# o teto tem que ser por TURNO (senão uma mensagem antiga consome a cota de
+# todas as seguintes), e insistir não é garantia — só entregar é.
+MAX_INSISTENCIA = 2
+ESTADO = Path.home() / ".local/share/unity-supervisor/exige-resposta.json"
+
+
+def liberar():
+    sys.exit(0)
+
+
+def eventos(caminho):
+    try:
+        for linha in Path(caminho).read_text(errors="replace").splitlines():
+            try:
+                yield json.loads(linha)
+            except Exception:
+                continue
+    except Exception:
+        return
+
+
+def entregar_no_lugar_dela(payload, texto_do_transcript):
+    """Último recurso: o hook manda a resposta dela por conta própria.
+
+    Chega aqui quando ela já foi avisada MAX_INSISTENCIA vezes e mesmo assim
+    fechou o turno sem chamar o reply. A alternativa seria deixar passar — que
+    é exatamente a queixa do dono ("mando mensagem e não tem resposta"). Entre
+    uma resposta mal formatada e nenhuma resposta, a mal formatada ganha.
+
+    Marca com ⤵ para ele saber que veio por este caminho, e não confundir com
+    ela funcionando normalmente.
+    """
+    texto = (payload.get("last_assistant_message") or texto_do_transcript or "").strip()
+    if not texto:
+        texto = ("A Unity terminou o turno sem responder e sem deixar texto. "
+                 "Reformule a pergunta, por favor.")
+    try:
+        import importlib.machinery
+        import importlib.util
+        ld = importlib.machinery.SourceFileLoader(
+            "unity_lib", "/home/reaper/.local/bin/unity-lib.py")
+        sp = importlib.util.spec_from_loader("unity_lib", ld)
+        lib = importlib.util.module_from_spec(sp)
+        ld.exec_module(lib)
+        lib.send_telegram("⤵ " + texto[:3000], silent=False)
+        with open(Path.home() / ".local/share/unity-supervisor/entrega-forcada.log",
+                  "a") as fh:
+            import datetime
+            fh.write(f"{datetime.datetime.now().isoformat(timespec='seconds')} "
+                     f"{payload.get('session_id','?')} {texto[:120]!r}\n")
+    except Exception:
+        pass
+
+
+def main():
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:
+        liberar()
+
+    caminho = payload.get("transcript_path")
+    sid = payload.get("session_id") or "?"
+    if not caminho or not Path(caminho).is_file():
+        liberar()
+
+    # Varre de trás para frente: acha a última mensagem do Telegram e vê se
+    # depois dela houve reply. "Depois dela" é o que importa — um reply antigo
+    # não responde a pergunta nova.
+    respondeu = False
+    achou_canal = False
+    marca_turno = ""
+    ultimo_texto = ""
+    for d in eventos(caminho):
+        tipo = d.get("type")
+        m = d.get("message") or {}
+        c = m.get("content")
+        if tipo == "user" and isinstance(c, str) and CANAL.search(c):
+            achou_canal = True
+            respondeu = False          # zera: chegou pergunta nova
+            ultimo_texto = ""
+            # A marca identifica ESTE turno. Sem ela o teto era por sessão, e
+            # uma mensagem antiga sem resposta gastava a cota de todas as
+            # próximas — a trava virava enfeite depois do segundo tropeço.
+            marca_turno = str(d.get("timestamp") or "")[:19] + "|" + c[:60]
+        elif tipo == "assistant" and isinstance(c, list):
+            for b in c:
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "tool_use" and b.get("name") == REPLY:
+                    respondeu = True
+                elif b.get("type") == "text" and b.get("text", "").strip():
+                    ultimo_texto = b["text"].strip()
+
+    if not achou_canal or respondeu:
+        # Sessão sem Telegram nenhum (teste, delegação) ou já respondeu.
+        liberar()
+
+    # Contador por sessão, para não insistir para sempre.
+    try:
+        estado = json.loads(ESTADO.read_text())
+    except Exception:
+        estado = {}
+    chave = f"{sid}|{marca_turno}"
+    n = int(estado.get(chave, 0))
+    if n >= MAX_INSISTENCIA:
+        entregar_no_lugar_dela(payload, ultimo_texto)
+        liberar()
+    estado[chave] = n + 1
+    # Poda: sem isto o arquivo cresce para sempre com turnos já resolvidos.
+    if len(estado) > 200:
+        estado = dict(list(estado.items())[-50:])
+    try:
+        ESTADO.parent.mkdir(parents=True, exist_ok=True)
+        ESTADO.write_text(json.dumps(estado))
+    except Exception:
+        pass
+
+    print(json.dumps({
+        "decision": "block",
+        "reason": (
+            "Voce nao respondeu no Telegram. A ultima mensagem do dono no canal "
+            "ainda esta sem resposta: escrever o texto no seu terminal nao "
+            "entrega nada a ele, ele so ve o 👀 de recebido e mais nada.\n\n"
+            "Chame AGORA mcp__plugin_telegram_telegram__reply com o chat_id da "
+            "mensagem e o texto da sua resposta. Se a ferramenta nao estiver "
+            "disponivel, rode antes: ToolSearch(query: "
+            "\"select:mcp__plugin_telegram_telegram__reply\").\n\n"
+            "Se voce ja tinha uma resposta pronta como texto, mande essa mesma. "
+            "Nao comente este aviso com ele."
+        ),
+    }))
+    sys.exit(0)
+
+
+main()

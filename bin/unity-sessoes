@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""Quantas sessões do Claude Code estão vivas agora, e há quanto tempo paradas.
+
+Duas saídas:
+  unity-sessoes            linhas curtas, prontas para o Telegram
+  unity-sessoes --json     para o unity-handoff-vigia consumir
+
+Fonte da verdade do que está VIVO é `claude agents --json` (fala com o daemon
+pelo socket). Fonte da verdade do que está PARADO é o mtime do transcript: o
+`startedAt` do daemon diz quando nasceu, não quando teve atividade, e uma sessão
+aberta desde ontem de manhã não é uma sessão ocupada.
+"""
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+PROJETOS = Path.home() / ".claude/projects"
+# 25 s, o mesmo do unity-ensure: daemon ocupado que não responde é lido como
+# "nenhuma sessão", e sem timeout o script trava a resposta do Telegram.
+TIMEOUT = 25
+
+
+def slug(cwd):
+    """`/home/reaper/projetos` -> `-home-reaper-projetos`."""
+    return cwd.replace("/", "-")
+
+
+def transcript(cwd, session_id):
+    p = PROJETOS / slug(cwd) / f"{session_id}.jsonl"
+    return p if p.is_file() else None
+
+
+def agentes():
+    try:
+        saida = subprocess.run(
+            ["claude", "agents", "--json"],
+            capture_output=True, text=True, timeout=TIMEOUT,
+        ).stdout
+        d = json.loads(saida)
+    except Exception:
+        return []
+    return d if isinstance(d, list) else d.get("agents", [])
+
+
+def delegacoes():
+    """Delegações vivas, do spool do unity-delegar."""
+    try:
+        saida = subprocess.run(
+            ["unity-delegar", "--lista", "--json"],
+            capture_output=True, text=True, timeout=15,
+        ).stdout.strip()
+        if saida.startswith(("[", "{")):
+            d = json.loads(saida)
+            return d if isinstance(d, list) else d.get("delegacoes", [])
+    except Exception:
+        pass
+    # Sem --json no unity-delegar: conta as linhas do texto, que é o que existe.
+    try:
+        txt = subprocess.run(
+            ["unity-delegar", "--lista"],
+            capture_output=True, text=True, timeout=15,
+        ).stdout
+        if "nenhuma" in txt.lower():
+            return []
+        return [{"linha": l.strip()} for l in txt.splitlines() if l.strip()]
+    except Exception:
+        return []
+
+
+def coletar():
+    agora = time.time()
+    lista = []
+    for a in agentes():
+        cwd = a.get("cwd") or ""
+        sid = a.get("sessionId") or ""
+        t = transcript(cwd, sid) if (cwd and sid) else None
+        # Sem transcript legível, o startedAt é a única âncora que sobra. É pior
+        # (superestima a ociosidade), mas é melhor que declarar "0 s parada".
+        if t:
+            ocioso = int(agora - t.stat().st_mtime)
+        elif a.get("startedAt"):
+            ocioso = int(agora - a["startedAt"] / 1000)
+        else:
+            ocioso = None
+        lista.append({
+            "pid": a.get("pid"),
+            "id": a.get("id"),
+            "sessionId": sid,
+            "cwd": cwd,
+            "kind": a.get("kind") or ("background" if a.get("id") else "interactive"),
+            "status": a.get("status"),
+            "nome": a.get("name") or "",
+            "ocioso_s": ocioso,
+            "transcript": str(t) if t else None,
+            "unity": cwd == str(Path.home()) and bool(a.get("id")),
+        })
+    lista.sort(key=lambda x: (x["ocioso_s"] is None, -(x["ocioso_s"] or 0)))
+    return lista
+
+
+def humano(seg):
+    if seg is None:
+        return "?"
+    if seg < 60:
+        return f"{seg}s"
+    if seg < 3600:
+        return f"{seg // 60}min"
+    h, m = divmod(seg // 60, 60)
+    return f"{h}h{m:02d}"
+
+
+def main():
+    if "--json" in sys.argv:
+        print(json.dumps({
+            "sessoes": coletar(),
+            "delegacoes": delegacoes(),
+        }, ensure_ascii=False))
+        return
+
+    ses = coletar()
+    deleg = delegacoes()
+    inter = [s for s in ses if s["kind"] == "interactive"]
+    fundo = [s for s in ses if s["kind"] != "interactive"]
+
+    # Formato do Telegram: uma ideia por linha, até ~35 colunas, sem markdown.
+    def plural(n, um, muitos):
+        return f"{n} {um if n == 1 else muitos}"
+
+    linhas = [f"🧭 {plural(len(ses), 'sessao ativa', 'sessoes ativas')}"]
+    if inter:
+        linhas.append(plural(len(inter), "interativa · voce", "interativas · voce"))
+    if fundo:
+        linhas.append(f"{len(fundo)} de fundo")
+    if deleg:
+        linhas.append(plural(len(deleg), "delegacao rodando", "delegacoes rodando"))
+    if not ses and not deleg:
+        linhas = ["🧭 Nenhuma sessao ativa"]
+
+    for s in ses:
+        nome = s["nome"] or (s["cwd"].rsplit("/", 1)[-1] if s["cwd"] else "?")
+        marca = "eu" if s["unity"] else nome[:18]
+        linhas.append(f"· {marca} — parada {humano(s['ocioso_s'])}")
+
+    print("\n".join(linhas))
+
+
+main()

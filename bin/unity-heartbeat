@@ -1,0 +1,395 @@
+#!/usr/bin/env python3
+"""Avisa no Telegram, a cada rodada do timer, o que está rodando de verdade.
+
+Existe porque medido em 04/08/2026: uma delegação (reciclabr-digital-twin,
+c1a8ddbb) terminou com sucesso, mas a sessão da Unity morreu (queda do daemon,
+`cause=upgrade`) antes do dono ver qualquer atualização de progresso — e a
+sessão nova que assumiu não tinha memória nenhuma da promessa de "1h de
+prazo". Pedido do dono: enquanto algo estiver rodando, um retrato a cada 10 min
+— para não depender de perguntar à Unity (que pode estar no meio de uma queda
+justamente quando ele pergunta).
+
+Não fala com o modelo, não passa pela sessão da Unity: lê `unity-delegar
+--lista-json` (prova de vida por PID, a mesma do `unity-pendencias`) e as
+últimas linhas do log de cada uma. Silencioso quando não há nada rodando —
+sem isso o timer de 10 em 10 minutos viraria ruído o dia inteiro.
+"""
+import json
+import os
+import re
+import subprocess
+import time
+import importlib.util
+from pathlib import Path
+
+SPOOL = Path.home() / ".local/share/unity-orquestrador"
+
+
+def carregar_lib():
+    spec = importlib.util.spec_from_file_location(
+        "unity_lib", str(Path.home() / ".local/bin/unity-lib.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def ultima_linha_log(ident):
+    log = SPOOL / f"{ident}.log"
+    if not log.exists():
+        return ""
+    try:
+        linhas = log.read_text(errors="replace").strip().splitlines()
+    except Exception:
+        return ""
+    for linha in reversed(linhas):
+        linha = linha.strip()
+        if linha:
+            return linha[:180]
+    return ""
+
+
+# ─── Trabalho da própria Unity, não só delegação ────────────────────────────
+# Pedido do dono em 19/08/2026: "avise que está executando algo de 5 em 5 min
+# até terminar, para eu saber". O heartbeat original só enxergava delegação —
+# quando ela mesma passava 10 min mexendo em arquivo, ele não via nada e ficava
+# achando que ela tinha morrido.
+ESTADO_SESSAO = SPOOL.parent / "unity-supervisor/heartbeat-sessao.json"
+ESPERA_MINIMA = 300      # 5 min: abaixo disso é trabalho normal, não vale aviso
+
+
+def sessao_da_unity():
+    """A sessão de fundo dela: de fundo e com cwd em $HOME (a mesma marca que o
+    unity-ensure usa para não confundir com uma sessão avulsa)."""
+    try:
+        saida = subprocess.run(["claude", "agents", "--json"],
+                               capture_output=True, text=True, timeout=25).stdout
+        d = json.loads(saida)
+    except Exception:
+        return None
+    for a in (d if isinstance(d, list) else d.get("agents", [])):
+        if a.get("id") and a.get("cwd") == str(Path.home()):
+            return a
+    return None
+
+
+def contexto_do_turno(session_id):
+    """O que ela está fazendo agora: quando o turno começou, o pedido do dono e
+    a última ferramenta usada. Lido do transcript, que é a única fonte que
+    enxerga dentro da sessão sem falar com o modelo."""
+    import re
+    arq = Path.home() / ".claude/projects/-home-reaper" / f"{session_id}.jsonl"
+    if not arq.is_file():
+        return None, "", ""
+    canal = re.compile(r"<channel\b[^>]*>(.*?)</channel>", re.S)
+    inicio = None; pedido = ""; ultima = ""
+    from datetime import datetime
+    for linha in arq.read_text(errors="replace").splitlines():
+        try:
+            d = json.loads(linha)
+        except Exception:
+            continue
+        ts = d.get("timestamp"); m = d.get("message") or {}; c = m.get("content")
+        if d.get("type") == "user" and isinstance(c, str) and "<channel" in c:
+            mm = canal.search(c)
+            pedido = (mm.group(1).strip() if mm else c)[:70]
+            if ts:
+                inicio = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+        elif d.get("type") == "assistant" and isinstance(c, list):
+            for b in c:
+                if isinstance(b, dict) and b.get("type") == "tool_use":
+                    ultima = b.get("name", "")
+    return inicio, pedido, ultima
+
+
+def avisar_sessao(lib):
+    """Devolve True se mandou aviso sobre o trabalho dela própria."""
+    a = sessao_da_unity()
+    if not a or a.get("status") != "busy":
+        # Terminou (ou nem começou): zera o estado para o próximo turno poder avisar.
+        try:
+            ESTADO_SESSAO.unlink()
+        except Exception:
+            pass
+        return False
+
+    sid = a.get("sessionId") or ""
+    inicio, pedido, ultima = contexto_do_turno(sid)
+    if not inicio:
+        return False
+    decorrido = int(time.time() - inicio)
+    if decorrido < ESPERA_MINIMA:
+        return False
+
+    # Um aviso por janela de 5 min, por turno. Sem esta chave o timer avisaria
+    # de novo a cada passada mesmo sem nada ter mudado.
+    try:
+        estado = json.loads(ESTADO_SESSAO.read_text())
+    except Exception:
+        estado = {}
+    marca = f"{sid}:{int(inicio)}"
+    if estado.get("marca") == marca and time.time() - estado.get("ultimo", 0) < ESPERA_MINIMA:
+        return False
+
+    # Progresso x travamento: o dono pediu para distinguir os dois ("para eu
+    # entender que ela está rodando algo ou ficou travada"). O sinal é o mtime
+    # do transcript: se ele não andou desde o aviso anterior, ela não escreveu
+    # nada nesse intervalo — está parada, não pensando.
+    arq = Path.home() / ".claude/projects/-home-reaper" / f"{sid}.jsonl"
+    try:
+        mtime = arq.stat().st_mtime
+    except Exception:
+        mtime = 0
+    mtime_anterior = estado.get("mtime", 0) if estado.get("marca") == marca else 0
+    parada_ha = int(time.time() - mtime) if mtime else 0
+    travada = bool(mtime_anterior) and mtime <= mtime_anterior
+
+    if travada:
+        linhas = [f"⚠️ Parece travada ha {parada_ha // 60}min"]
+    else:
+        linhas = [f"⏳ Ainda trabalhando ha {decorrido // 60}min"]
+    if pedido:
+        linhas.append("")
+        linhas.append(f"Pedido: {pedido}")
+    if ultima:
+        linhas.append(f"Agora em: {ultima}")
+    linhas.append("")
+    if travada:
+        linhas.append("Sem atividade nova desde o")
+        linhas.append("ultimo aviso. Me chame se quiser")
+        linhas.append("que eu reinicie.")
+    else:
+        linhas.append("Aviso quando terminar.")
+    lib.send_telegram("\n".join(linhas), silent=True)
+
+    try:
+        ESTADO_SESSAO.parent.mkdir(parents=True, exist_ok=True)
+        ESTADO_SESSAO.write_text(json.dumps(
+            {"marca": marca, "ultimo": time.time(), "mtime": mtime}))
+    except Exception:
+        pass
+    return True
+
+
+# ─── Fila parada: travamento SEM status "busy" ──────────────────────────────
+# Medido em 28/08/2026. A sessão dela recebeu a mensagem 1289 às 23:23:08 UTC,
+# aceitou como turno, e nunca emitiu resposta. Ficou 40 min assim, com 5 itens
+# na fila (2 mensagens do dono, 2 notificações e um cutucão de teste), até ele
+# perceber pelo silêncio.
+#
+# `avisar_sessao` não viu nada: ela exige status "busy", e o daemon reportava
+# "waiting" — do ponto de vista dele a sessão estava ociosa, esperando input.
+# O sintoma real é outro e não depende do status: **existe entrada mais nova
+# que a última saída dela**. É isso que se mede aqui.
+#
+# Não confundir com trabalho normal: quando ela está pensando, o status é
+# "busy" e quem avisa é `avisar_sessao`. Este aviso é para o caso oposto —
+# ninguém trabalhando e mesmo assim a fila parada.
+LIMITE_FILA = int(os.environ.get("UNITY_LIMITE_FILA", 600))   # 10 min
+ESTADO_FILA = SPOOL.parent / "unity-supervisor/heartbeat-fila.json"
+
+
+def _ts(valor):
+    """ISO -> epoch. Devolve 0 no que não der para ler."""
+    if not valor:
+        return 0
+    try:
+        import datetime
+        return datetime.datetime.fromisoformat(
+            valor.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0
+
+
+def entrada_sem_saida(session_id):
+    """(epoch_da_entrada, resumo) da entrada mais nova ainda sem resposta.
+
+    Entrada = mensagem do Telegram (aceita como turno ou só enfileirada) ou
+    notificação de tarefa. Saída = qualquer mensagem `assistant`. Se a entrada
+    mais nova for POSTERIOR à saída mais nova, ela deve a alguém uma resposta.
+    """
+    arq = Path.home() / ".claude/projects/-home-reaper" / f"{session_id}.jsonl"
+    ult_saida = 0.0
+    ult_entrada = 0.0
+    resumo = ""
+    try:
+        with open(arq, encoding="utf-8", errors="replace") as fh:
+            for linha in fh:
+                try:
+                    d = json.loads(linha)
+                except Exception:
+                    continue
+                t = d.get("type")
+                quando = _ts(d.get("timestamp"))
+                if not quando:
+                    continue
+                if t == "assistant":
+                    if quando > ult_saida:
+                        ult_saida = quando
+                elif t == "queue-operation" and d.get("operation") == "enqueue":
+                    if quando > ult_entrada:
+                        ult_entrada, resumo = quando, str(d.get("content", ""))
+                elif t == "user":
+                    c = (d.get("message", {}) or {}).get("content")
+                    if isinstance(c, str) and "plugin:telegram" in c:
+                        if quando > ult_entrada:
+                            ult_entrada, resumo = quando, c
+    except Exception:
+        return 0.0, ""
+    if ult_entrada <= ult_saida:
+        return 0.0, ""
+    resumo = re.sub(r"<[^>]+>", " ", resumo)
+    resumo = re.sub(r"\s+", " ", resumo).strip()
+    return ult_entrada, resumo[:160]
+
+
+def avisar_fila_parada(lib):
+    """True se avisou que a fila dela parou sem ninguém trabalhando."""
+    a = sessao_da_unity()
+    if not a:
+        return False
+    if a.get("status") == "busy":
+        return False          # trabalhando: quem cobre é avisar_sessao
+    sid = a.get("sessionId") or ""
+    if not sid:
+        return False
+
+    quando, resumo = entrada_sem_saida(sid)
+    if not quando:
+        return False
+    parada_ha = int(time.time() - quando)
+    if parada_ha < LIMITE_FILA:
+        return False          # janela normal entre chegar e começar a pensar
+
+    marca = f"{sid}:{int(quando)}"
+    try:
+        estado = json.loads(ESTADO_FILA.read_text())
+    except Exception:
+        estado = {}
+    if estado.get("marca") == marca and time.time() - estado.get("ultimo", 0) < ESPERA_MINIMA:
+        return False
+
+    linhas = [f"🧊 Travada ha {parada_ha // 60}min",
+              "",
+              "Recebi e nao respondi. Status diz",
+              f"'{a.get('status')}', ou seja, ninguem esta",
+              "trabalhando nisso."]
+    if resumo:
+        linhas += ["", f"Preso: {resumo}"]
+    linhas += ["", "Me chame para reiniciar a sessao."]
+    lib.send_telegram("\n".join(linhas), silent=True)
+
+    try:
+        ESTADO_FILA.parent.mkdir(parents=True, exist_ok=True)
+        ESTADO_FILA.write_text(json.dumps({"marca": marca, "ultimo": time.time()}))
+    except Exception:
+        pass
+    return True
+
+
+TETO_VIVO = int(os.environ.get("UNITY_TETO_VIVO", 5 * 1024 * 1024))   # 5 MB
+ESTADO_INCHACO = SPOOL.parent / "unity-supervisor/transcript-inchado.json"
+
+
+def avisar_inchaco(lib):
+    """Avisa quando o transcript da sessao VIVA fica grande demais.
+
+    O teto do unity-ensure so decide na RETOMADA; enquanto a sessao vive, o
+    transcript cresce sem freio e cada turno reenvia tudo. Medido em
+    21/08/2026: automacao de navegador levou o dela a **24 MB** (20 MB so de
+    resultado de ferramenta — screenshot vira imagem no contexto e volta em
+    todo turno seguinte). Ela travou e a cota derreteu junto.
+
+    Aviso, nao acao: reciclar sozinha no meio de uma candidatura perderia
+    trabalho. Quem decide e o dono.
+    """
+    a = sessao_da_unity()
+    if not a:
+        return
+    arq = Path.home() / ".claude/projects/-home-reaper" / f"{a['sessionId']}.jsonl"
+    try:
+        tam = arq.stat().st_size
+    except Exception:
+        return
+    if tam < TETO_VIVO:
+        return
+    try:
+        if json.loads(ESTADO_INCHACO.read_text()).get("sid") == a["sessionId"]:
+            return                      # um aviso por sessao
+    except Exception:
+        pass
+    lib.send_telegram(
+        f"⚠️ Minha sessao esta pesada\n\n"
+        f"{tam // 1048576} MB de historico. Cada\n"
+        f"resposta minha reenvia isso, entao\n"
+        f"fica lenta e cara — normalmente e\n"
+        f"screenshot de navegador acumulado.\n\n"
+        f"Me diga 'recomeca' quando puder que\n"
+        f"eu nasco limpa (guardo o resumo\n"
+        f"antes, nao perco o contexto).", silent=False)
+    try:
+        ESTADO_INCHACO.parent.mkdir(parents=True, exist_ok=True)
+        ESTADO_INCHACO.write_text(json.dumps({"sid": a["sessionId"], "tam": tam}))
+    except Exception:
+        pass
+
+
+def main():
+    lib_ = carregar_lib()
+    avisar_inchaco(lib_)
+    # Trabalho dela própria primeiro: é o que o dono não tinha visibilidade nenhuma.
+    avisou_sessao = avisar_sessao(lib_)
+    # Travamento sem "busy": o buraco que deixou 28/08 passar 40 min calado.
+    if not avisou_sessao:
+        avisou_sessao = avisar_fila_parada(lib_)
+
+    saida = subprocess.run(
+        ["/home/reaper/.local/bin/unity-delegar", "--lista-json"],
+        capture_output=True, text=True, timeout=30)
+    try:
+        vivas = json.loads(saida.stdout or "{}")
+    except json.JSONDecodeError:
+        return 0
+
+    if not vivas:
+        return 0
+    if avisou_sessao:
+        return 0   # já mandou um aviso nesta passada; dois seguidos é ruído
+
+    agora = time.time()
+    linhas = []
+    for ident, r in sorted(vivas.items(), key=lambda kv: kv[1].get("iniciado_em", 0)):
+        decorrido = int(agora - r.get("iniciado_em", agora))
+        m, s = divmod(decorrido, 60)
+        ultima = ultima_linha_log(ident)
+        linha = f"• {r.get('projeto', '?')} ({r.get('nivel', '?')}, {ident}) — {m}min rodando"
+        if ultima:
+            linha += f"\n  ↳ {ultima}"
+        linhas.append(linha)
+
+    # Espaçamento de 5 min, decidido AQUI e não pelo timer. Em 21/08/2026 baixei
+    # o timer de 5 para 2 min (para o primeiro aviso não demorar até 10), e sem
+    # esta trava o aviso de delegação passou a sair a cada 2 min — o dono viu
+    # "0min / 2min / 4min rodando" em sequência. Granularidade fina no timer,
+    # espaçamento no código; o aviso de sessão já fazia isso, este não fazia.
+    estado_d = SPOOL.parent / "unity-supervisor/heartbeat-delegacao.json"
+    marca = ",".join(sorted(vivas))
+    try:
+        ant = json.loads(estado_d.read_text())
+        if ant.get("marca") == marca and time.time() - ant.get("ultimo", 0) < 300:
+            return 0
+    except Exception:
+        pass
+
+    texto = "🔄 Ainda trabalhando:\n\n" + "\n".join(linhas)
+    lib = carregar_lib()
+    lib.send_telegram(texto, silent=True, rodape=False)
+    try:
+        estado_d.parent.mkdir(parents=True, exist_ok=True)
+        estado_d.write_text(json.dumps({"marca": marca, "ultimo": time.time()}))
+    except Exception:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

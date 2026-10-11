@@ -1,0 +1,8 @@
+[Unit]
+Description=Unity — avisa no Telegram se uma sessao de fundo travou em prompt de permissao
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/reaper
+Environment=PATH=/home/reaper/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/reaper/.local/bin/unity-vigia-bloqueio

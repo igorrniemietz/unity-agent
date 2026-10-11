@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""Áudio -> texto, em português do Brasil.
+
+  unity-transcreve nota-de-voz.ogg          imprime SÓ o texto no stdout
+  unity-transcreve nota.ogg -v              idem, com diagnóstico no stderr
+
+Feito para a nota de voz do Telegram (OGG/Opus) que já chega salva em disco
+pelo download_attachment. O texto sai limpo no stdout para o chamador capturar
+— nada além dele, nenhum aviso. Diagnóstico (modelo, GPU/CPU) só com -v, e
+sempre no stderr.
+
+Roda em CUDA na RTX 3060 da caixa (WSL) via faster-whisper. O ctranslate2
+carrega cuDNN e cuBLAS em tempo de execução, e estas libs vêm dos pacotes
+nvidia-* do pip — o glibc lê LD_LIBRARY_PATH só na largada do processo, então
+se o caminho delas não estiver no ambiente este script se re-executa uma vez
+com o caminho certo antes de importar o faster-whisper. Se a GPU falhar de
+verdade, cai para CPU (int8): mais lento, mas nunca falha em silêncio.
+
+Modelo "small" de propósito: nota de voz curta pede resposta rápida, e a caixa
+tem 3 GB de RAM — "medium" só pesaria. UNITY_WHISPER_MODEL troca se um dia
+precisar de mais acurácia.
+"""
+import os
+import site
+import sys
+from pathlib import Path
+
+MODELO = os.environ.get("UNITY_WHISPER_MODEL", "small")
+IDIOMA = "pt"
+
+
+def dirs_cuda():
+    """Onde a GPU deste box mora: libs nvidia-* do pip + o driver do WSL."""
+    base = Path(site.getusersitepackages())
+    return [
+        base / "nvidia/cudnn/lib",
+        base / "nvidia/cublas/lib",
+        base / "nvidia/cuda_nvrtc/lib",
+        Path("/usr/lib/wsl/lib"),
+    ]
+
+
+def garantir_ld():
+    """Re-executa com LD_LIBRARY_PATH apontando para as libs de CUDA.
+
+    Trocar LD_LIBRARY_PATH depois de o processo ter nascido não muda o que o
+    dlopen do ctranslate2 enxerga — só relançando. Guarda com a env pra não
+    entrar em loop se os diretórios sumirem.
+    """
+    if os.environ.get("UNITY_LD_OK") == "1":
+        return
+    atuais = (os.environ.get("LD_LIBRARY_PATH") or "").split(":")
+    faltando = [d for d in dirs_cuda() if d.is_dir() and str(d) not in atuais]
+    if not faltando:
+        return
+    env = dict(os.environ)
+    env["UNITY_LD_OK"] = "1"
+    env["LD_LIBRARY_PATH"] = ":".join([str(d) for d in faltando] + [p for p in atuais if p])
+    os.execve(sys.executable, [sys.executable, *sys.argv], env)
+
+
+def carregar(modelo, log):
+    """Modelo na GPU; se CUDA não colaborar, na CPU. Sem exceção propagando."""
+    from faster_whisper import WhisperModel
+
+    try:
+        m = WhisperModel(modelo, device="cuda", compute_type="float16")
+        log(f"device=cuda (float16) modelo={modelo}")
+        return m
+    except Exception as exc:  # cudnn/cublas/driver ausente, VRAM estourada…
+        log(f"cuda indisponível ({type(exc).__name__}: {exc}); usando CPU")
+        m = WhisperModel(modelo, device="cpu", compute_type="int8")
+        log(f"device=cpu (int8) modelo={modelo}")
+        return m
+
+
+def main():
+    argv = [a for a in sys.argv[1:] if a not in ("-v", "--info")]
+    verbose = "-v" in sys.argv or "--info" in sys.argv
+
+    if len(argv) != 1:
+        print("uso: unity-transcreve <arquivo-de-audio> [-v]", file=sys.stderr)
+        return 2
+
+    caminho = Path(argv[0])
+    if not caminho.is_file():
+        print(f"arquivo não encontrado: {caminho}", file=sys.stderr)
+        return 1
+
+    # stderr: os avisos do huggingface/ctranslate2 já vão para cá sozinhos, e
+    # nunca podem poluir o stdout que o chamador captura.
+    def log(msg):
+        if verbose:
+            print(msg, file=sys.stderr, flush=True)
+
+    garantir_ld()
+    modelo = carregar(MODELO, log)
+
+    segments, _info = modelo.transcribe(
+        str(caminho),
+        language=IDIOMA,
+        vad_filter=True,        # corta silêncio: acelera e evita alucinação
+        beam_size=5,
+    )
+    texto = " ".join(s.text.strip() for s in segments).strip()
+    log(f"{len(texto)} caracteres")
+    print(texto)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

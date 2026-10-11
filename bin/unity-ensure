@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Garante que existe UMA sessão de fundo dona do canal do Telegram.
+# Garante que existe UMA sessão de fundo dona do canal do Telegram, rodando
+# sempre no Claude Sonnet 5.
 #
 # Por que isto existe: `claude daemon --help` diz, com todas as letras, que
 # "service install is disabled in this version — the daemon runs on demand and
@@ -10,6 +11,14 @@
 #
 # Idempotente de propósito: rodar de minuto em minuto não deve criar nada novo
 # quando já está tudo certo.
+#
+# Até 2026-08-04 este script também trocava o cérebro da Unity por DeepSeek
+# (via opencode) quando a cota do Claude passava de 92%, o "modo econômico".
+# Foi removido por pedido do dono: dois cérebros diferentes conforme a cota do
+# dia bugava mais do que ajudava. Agora só existe UM modo: Sonnet 5, sempre. Se
+# a janela de 5 h estourar, o canal fica sem responder até ela renovar — não
+# há mais fallback automático. `unity-fallback` e `unity-modo-forcar` ficam no
+# disco desativados (nada mais os chama), não apagados.
 set -uo pipefail
 export PATH="$HOME/.nvm/versions/node/v24.18.0/bin:$HOME/.local/bin:/usr/bin:/bin"
 
@@ -61,98 +70,116 @@ try:
 except Exception: pass' 2>/dev/null
 }
 
-# ---------------------------------------------------------------------------
-# Árbitro de modo: quem é a Unity agora, o Claude ou o DeepSeek?
+# Retomar sessão velha demais não é continuar, é ressuscitar: o trabalho já
+# perdeu o contexto do mundo (arquivos mudaram, o dono pediu outra coisa) e a
+# sessão volta cara, porque `--resume` reenvia o transcript inteiro.
+# Reduzido de 12 h para 2 h em 19/08/2026, por LATÊNCIA. O `--resume` reenvia o
+# transcript inteiro, e arrastando 12 h ele chegou a 300 KB (~75 mil tokens) —
+# que é o que a Unity reprocessa a cada renascimento, e ela renasce a cada ~1 h
+# de ociosidade. O dono sentiu isso como "vê rápido mas demora a responder": o
+# 👀 é o servidor do canal (instantâneo), a demora é o prefill do contexto.
 #
-# Quando a janela de 5 h da assinatura acaba, a sessão Claude para de responder
-# e o canal fica MUDO — sem erro, sem aviso. O modo econômico troca o cérebro
-# por DeepSeek v4 Flash dentro do opencode (grátis, fora da cota da Anthropic)
-# para o Igor continuar sendo atendido e continuar conseguindo despachar pro
-# Gemini, que também é grátis.
-#
-# ESTE SCRIPT É O ÚNICO ÁRBITRO. O Telegram aceita um consumidor de getUpdates
-# por token; os dois modos no ar ao mesmo tempo fazem mensagem sumir
-# alternadamente. Então aqui sempre se DERRUBA um antes de subir o outro.
-#
-# Histerese de propósito: entra em 92% e só volta em 85%. Com um limiar só, o
-# uso oscilando em torno dele trocaria de modo a cada 2 minutos, e cada volta ao
-# Claude custa ~19 mil tokens de sessão nova — o próprio remédio consumiria a
-# cota que ele existe para preservar.
-ENTRA_ECONOMICO="${UNITY_LIMIAR_ENTRA:-92}"
-VOLTA_NORMAL="${UNITY_LIMIAR_VOLTA:-85}"
-MODO_ARQ="$HOME/.local/share/unity-supervisor/modo"
-MODO_ATUAL="$(cat "$MODO_ARQ" 2>/dev/null || echo claude)"
+# 2 h preserva a continuidade dentro de uma conversa de verdade e joga fora o
+# arrasto de ontem. O que se perde de contexto agora tem rede: o
+# `unity-handoff-vigia` grava handoff aos 1h30 e o ai-memory guarda o durável.
+RETOMAR_VALIDADE="${UNITY_RETOMAR_VALIDADE:-7200}"   # 2 h
 
-PCT="$(unity-quota 2>/dev/null | awk '{print $1}')"
-if [ -z "$PCT" ]; then
-  # Fonte de cota muda. NUNCA tratar como 0% nem como 100%: um erro transitório
-  # do ai-usagebar não é motivo para trocar o cérebro da Unity. Mantém o modo.
-  log "AVISO: unity-quota não respondeu — mantendo modo '$MODO_ATUAL'"
-  MODO_ALVO="$MODO_ATUAL"
-elif [ "$PCT" -ge "$ENTRA_ECONOMICO" ]; then
-  MODO_ALVO="economico"
-elif [ "$PCT" -le "$VOLTA_NORMAL" ]; then
-  MODO_ALVO="claude"
-else
-  MODO_ALVO="$MODO_ATUAL"   # zona morta da histerese
-fi
-
-derrubar_canal_claude() {
-  for id in $(agentes_de_fundo); do
-    timeout 25 claude stop "$id" >/dev/null 2>&1 \
-      && log "sessão Claude $id encerrada (troca de modo)"
-  done
-  for pid in $(ps -eo pid,args | grep -E '[s]erver[.]ts' | awk '{print $1}'); do
-    kill "$pid" 2>/dev/null
-  done
-  sleep 2
+# O `id` curto que o `agents --json` mostra NÃO serve para `--resume`, que quer
+# o sessionId completo. Os dois vêm no mesmo JSON; pegar o certo aqui evita um
+# `--resume` que falha calado.
+#
+# Filtra por cwd == $HOME de propósito. Medido em 02/08: uma sessão de fundo
+# avulsa (teste, tarefa despachada) convive com a da Unity, e "pega a primeira
+# da lista" retomaria a sessão errada — a Unity voltaria com o contexto de
+# outro trabalho. A Unity é lançada por este script, que roda sem
+# WorkingDirectory no systemd e portanto nasce em $HOME. É a única marca que
+# distingue as duas sem pedir nada de novo ao CLI.
+sessionid_de_fundo() {
+  timeout 25 claude agents --json 2>/dev/null \
+    | HOME_ESPERADO="$HOME" python3 -c 'import sys,json,os
+try:
+    d=json.load(sys.stdin); a=d if isinstance(d,list) else d.get("agents",[])
+    alvo=os.environ["HOME_ESPERADO"]
+    for x in a:
+        if x.get("id") and x.get("sessionId") and x.get("cwd")==alvo:
+            print(x["sessionId"]); break
+except Exception: pass' 2>/dev/null
 }
 
-fallback_ativo() { systemctl --user is-active --quiet unity-fallback.service; }
+# Fallback para quando o DAEMON TAMBÉM morreu (não só o agente) — o caso de
+# `cause=upgrade`/`cause=signal` medido em 04/08: `unity-daemon.service` tem
+# `KillMode=control-group`, então um restart do daemon leva a sessão de fundo
+# junto no mesmo golpe. Sem daemon não há socket para `claude agents --json`
+# responder, e ATÉ AGORA isso significava sempre "sessão nova, contexto zero" —
+# foi o que fez a Unity esquecer, no mesmo dia, uma delegação com prazo
+# prometido (a sessão morreu por upgrade antes dela conseguir cobrar o
+# resultado, e a sessão nova nasceu sem saber que a promessa existia).
+#
+# Lê do disco em vez de perguntar ao processo: acha o último id curto que
+# ESTE PRÓPRIO script anotou no seu log ao subir uma sessão ("backgrounded ·
+# XXXXXXXX"), e localiza o transcript completo por prefixo do nome do
+# arquivo — o sessionId completo é o próprio nome do arquivo sem ".jsonl".
+# Teto de TAMANHO, alem do teto de idade. Descoberto em 20/08/2026: o teto de
+# idade sozinho nao protege, porque um laco de respawn mantem o transcript
+# sempre "fresco" enquanto ele engorda. Chegou a 3,2 MB (~800 mil tokens), e
+# cada `--resume` reenviava tudo — foi isso que queimou metade da cota de 5h
+# com ela ociosa.
+#
+# Acima do teto vale mais nascer limpa: a continuidade real esta no handoff do
+# unity-handoff-vigia e no ai-memory, nao no transcript cru. E sessao pequena
+# ainda responde mais rapido, que era a outra queixa dele.
+RETOMAR_TAMANHO_MAX="${UNITY_RETOMAR_TAMANHO_MAX:-512000}"   # 500 KB
 
-if [ "$MODO_ALVO" = "economico" ]; then
-  if [ "$MODO_ATUAL" != "economico" ] || ! fallback_ativo; then
-    log "cota em ${PCT}% (>= ${ENTRA_ECONOMICO}%) — passando o canal para o DeepSeek"
-    derrubar_canal_claude
-    systemctl --user start unity-fallback.service \
-      && log "modo econômico no ar" || log "FALHA ao subir o modo econômico"
-    printf 'economico' > "$MODO_ARQ"
+transcript_grande_demais() {   # $1 = caminho do .jsonl
+  local bytes
+  bytes=$(stat -c%s "$1" 2>/dev/null || echo 0)
+  [ "$bytes" -gt "$RETOMAR_TAMANHO_MAX" ]
+}
+
+# Descartar sem gravar handoff e trocar custo por amnesia. Isto tem que ser UMA
+# funcao chamada por TODOS os caminhos de descarte: na primeira versao a chamada
+# ficou so no guard de $RESUMIR, e o descarte que acontece dentro de
+# sessionid_do_disco passava por fora — a sessao nascia limpa e sem contexto
+# nenhum, que e exatamente o defeito que o teto deveria ter evitado piorar.
+descartar_transcript() {   # $1 = caminho do .jsonl
+  log "transcript de $(basename "$1" .jsonl) tem $(( $(stat -c%s "$1")/1024 )) KB (teto $(( RETOMAR_TAMANHO_MAX/1024 )) KB) — nascendo limpa em vez de reenviar tudo"
+  if "$HOME/.local/bin/unity-handoff-vigia" --forcar "$1" "$HOME" 2>/dev/null; then
+    log "handoff gravado antes de descartar $(basename "$1" .jsonl)"
+  else
+    log "AVISO: nao consegui gravar handoff de $(basename "$1" .jsonl) — a sessao nova nasce sem contexto"
   fi
-  # Sai aqui de propósito: a lógica abaixo RECRIA a sessão Claude, e recriá-la
-  # agora poria os dois modos disputando o mesmo getUpdates.
-  exit 0
-fi
+}
 
-VOLTANDO=0
-if [ "$MODO_ATUAL" = "economico" ]; then
-  log "cota em ${PCT}% (<= ${VOLTA_NORMAL}%) — devolvendo o canal para o Claude"
-  systemctl --user stop unity-fallback.service 2>/dev/null
-  sleep 2   # deixa o getUpdates em curso terminar antes de outro assumir
-  VOLTANDO=1
-  # A entrada no modo econômico se anuncia sozinha (o próprio fallback avisa).
-  # A volta precisa ser anunciada aqui, porque quem volta é uma sessão nova que
-  # não sabe que houve troca. Sem este aviso o Igor não tem como saber com quem
-  # está falando — e a diferença importa: uma despacha pro Claude, a outra não.
-  python3 -c "
-import importlib.util as u
-s=u.spec_from_file_location('l','/home/reaper/.local/bin/unity-lib.py')
-m=u.module_from_spec(s); s.loader.exec_module(m)
-m.send_telegram('✅ Voltei ao normal — cota do Claude em ${PCT}%. Despacho pro Claude e pro Sonnet liberado de novo.', silent=False)" \
-    >/dev/null 2>&1
-fi
-printf 'claude' > "$MODO_ARQ"
-# ---------------------------------------------------------------------------
+sessionid_do_disco() {
+  local curto arq idade
+  curto="$(grep -o 'backgrounded · [0-9a-f]\{8\}' "$LOG" 2>/dev/null | tail -1 | awk '{print $NF}')"
+  [ -n "$curto" ] || return 1
+  arq="$(ls -t "$HOME/.claude/projects/-home-reaper/${curto}"*.jsonl 2>/dev/null | head -1)"
+  [ -n "$arq" ] || return 1
+  idade=$(( $(date +%s) - $(stat -c %Y "$arq" 2>/dev/null || echo 0) ))
+  if [ "$idade" -ge "$RETOMAR_VALIDADE" ]; then
+    return 1
+  fi
+  if transcript_grande_demais "$arq"; then
+    descartar_transcript "$arq"
+    return 1
+  fi
+  basename "$arq" .jsonl
+}
 
-# Estado entre execuções, para o amortecedor (ver adiante).
-FALHA="$HOME/.local/share/unity-supervisor/falha-anterior"
-
-# O amortecedor existe para não recriar a sessão num piscar de olho. Mas na
-# volta do modo econômico a ausência não é dúvida: fomos NÓS que derrubamos a
-# sessão Claude ao entrar. Esperar a segunda detecção deixaria o canal mudo por
-# mais 2 minutos sem nenhum ganho, então a confirmação já entra dada.
-if [ "$VOLTANDO" = "1" ]; then
-  printf 'volta-do-modo-economico' > "$FALHA"
-fi
+# Tenta pelo daemon primeiro (rápido e exato quando ele está de pé); só cai
+# para o disco quando o daemon não responde nada — nunca o contrário, porque
+# o daemon pode saber de uma sessão MAIS recente que a última que este script
+# lançou (ex: retomada manual do dono).
+ultimo_sessionid_conhecido() {
+  local sid
+  sid="$(sessionid_de_fundo)"
+  if [ -n "$sid" ]; then
+    printf '%s' "$sid"
+    return 0
+  fi
+  sessionid_do_disco
+}
 
 if [ "$(servidores_com_tty)" -gt 0 ]; then
   log "AVISO: servidor do plugin com TTY — sessão interativa disputando getUpdates"
@@ -166,6 +193,8 @@ fi
 AGENTES="$(agentes_de_fundo)"
 N_AGENTES=$(printf '%s' "$AGENTES" | wc -w)
 N_SERVIDORES=$(servidores_total)
+
+FALHA="$HOME/.local/share/unity-supervisor/falha-anterior"
 
 if [ "$N_AGENTES" -ge 1 ] && [ "$N_SERVIDORES" -ge 1 ]; then
   rm -f "$FALHA"
@@ -193,7 +222,7 @@ rm -f "$FALHA"
 # do plugin é um MCP stdio que só nasce junto com a sessão — não dá para
 # reconectar um novo à sessão antiga. Então a sessão órfã tem de SAIR antes de
 # subir a substituta. Sem isto ficariam duas sessões de fundo vivas, as duas
-# donas do mesmo canal: exatamente a duplicata que o Igor via.
+# donas do mesmo canal: exatamente a duplicata que o dono via.
 if [ "$N_AGENTES" -ge 1 ]; then
   for id in $AGENTES; do
     timeout 25 claude stop "$id" >/dev/null 2>&1 \
@@ -224,12 +253,101 @@ for arq in $INSTRUCOES; do
   fi
 done
 
-if [ -n "$PROMPT_EXTRA" ]; then
+# --model opus: TESTE TEMPORARIO decidido pelo dono em 25/09/2026, pra validar
+# custo real de rodar o cerebro da propria Unity em Opus em vez de Sonnet 5.
+# Ate 24/09/2026 isso era fixo em "sonnet" de proposito (ver
+# unity-ensure.bak-teste-opus-* pro comentario original): Opus era mais caro e
+# mais pesado na janela de 5h pra um trabalho que e so planejar e responder,
+# nao gerar codigo (isso continua sendo dos executores delegados, ver
+# roteamento.md). Se o custo nao compensar, volte esta linha pra "sonnet" —
+# o comentario original esta preservado no arquivo .bak- acima.
+subir_sessao() {   # argumentos = extras do claude; quem chama é quem loga
+  # --chrome: sem ele as ferramentas mcp__claude-in-chrome__* nem existem na
+  # sessao, e ela nao consegue candidatar em vaga nenhuma. Descoberto em
+  # 21/08/2026: as sessoes do dono sobem com a flag, as dela nunca subiram —
+  # e ela concluiu, errado, que era limitacao de sessao de fundo.
   UNITY_NO_TELEGRAM_HOOK=1 claude --bg --channels "$CANAL" --settings "$SETTINGS" \
-    --append-system-prompt "$PROMPT_EXTRA" \
-    >> "$LOG" 2>&1 && log "agente de fundo recriado (com instruções)" || log "FALHA ao recriar"
-else
-  log "AVISO: nenhuma instrução legível — subindo sem elas"
-  UNITY_NO_TELEGRAM_HOOK=1 claude --bg --channels "$CANAL" --settings "$SETTINGS" \
-    >> "$LOG" 2>&1 && log "agente de fundo recriado (sem persona)" || log "FALHA ao recriar"
+    --model opus --chrome "$@" \
+    >> "$LOG" 2>&1
+}
+
+[ -n "$PROMPT_EXTRA" ] || log "AVISO: nenhuma instrução legível — subindo sem elas"
+
+# Toda queda que não foi limpa — daemon reiniciado por upgrade/signal, o caso
+# mais comum medido em 04/08 — chega aqui sem sessão prévia identificada.
+# Tenta o disco antes de desistir, para não recomeçar do zero uma conversa que
+# só caiu por 20 segundos.
+RESUMIR="$(ultimo_sessionid_conhecido)"
+
+# O teto de tamanho vale para QUALQUER caminho de retomada, nao so o do disco:
+# quando o daemon responde, `sessionid_de_fundo` devolve o id sem olhar o
+# arquivo, e era por ali que o transcript de 3,2 MB continuava passando.
+if [ -n "$RESUMIR" ]; then
+  ARQ_RESUMIR="$HOME/.claude/projects/-home-reaper/${RESUMIR}.jsonl"
+  if [ -f "$ARQ_RESUMIR" ] && transcript_grande_demais "$ARQ_RESUMIR"; then
+    descartar_transcript "$ARQ_RESUMIR"
+    RESUMIR=""
+  fi
+fi
+
+if [ -n "$RESUMIR" ]; then
+  log "retomando sessão $RESUMIR após queda ($MOTIVO)"
+fi
+
+# A retomada é TENTADA, nunca exigida. Se o `--resume` falhar (transcript
+# apagado, sessionId que o daemon não conhece mais, versão do CLI sem a flag),
+# cair fora deixaria o canal mudo — e canal mudo é o defeito que este script
+# inteiro existe para evitar. Então: tenta retomar, e se não der, sobe nova.
+RETOMOU=0
+if [ -n "$RESUMIR" ]; then
+  # O empurrão é necessário: `--resume` devolve o contexto, mas a sessão volta
+  # ociosa. Sem prompt ela fica esperando o dono falar — que é exatamente o
+  # "não continuou sozinha" que a retomada veio consertar.
+  # O NUDGE custa caro: ele manda ela investigar o disco e reler o que estava em
+  # curso, e isso vira uma dezena de chamadas de ferramenta A CADA renascimento.
+  # Ela renasce ~4x/hora mesmo parada, entao na maior parte das vezes esse
+  # trabalho todo termina em "nao havia nada pela metade" — gasto puro.
+  #
+  # Subir SEM prompt e gratuito: `claude --bg --channels` sem argumento nasce
+  # ociosa e nao consome nada ate o dono falar. Entao so acorda ela se houver
+  # motivo verificavel: delegacao viva no spool.
+  if ! "$HOME/.local/bin/unity-delegar" --lista 2>/dev/null | grep -qv 'nenhuma delegação'; then
+    log "nada em curso — subindo ociosa, sem prompt (economiza o turno de retomada)"
+    NUDGE=""
+  else
+  NUDGE="Você acabou de ser retomada depois de uma queda de sessão (daemon reiniciado ou parecido). Releia o que estava em curso quando parou, verifique no disco o que já ficou pronto para não refazer, e siga de onde parou. Se não havia nada pela metade, não precisa avisar nada — fique ociosa."
+  fi
+  if [ -n "$PROMPT_EXTRA" ]; then
+    subir_sessao --resume "$RESUMIR" --append-system-prompt "$PROMPT_EXTRA" "$NUDGE" && RETOMOU=1
+  else
+    subir_sessao --resume "$RESUMIR" "$NUDGE" && RETOMOU=1
+  fi
+  if [ "$RETOMOU" = "1" ]; then
+    log "agente de fundo RETOMADO de $RESUMIR"
+  else
+    log "AVISO: falha ao retomar $RESUMIR — subindo sessão nova"
+  fi
+fi
+
+# SEM PROMPT, de propósito. Até 02/08 esta chamada passava a palavra `nova`
+# como argumento posicional, e argumento posicional do `claude` é PROMPT — não
+# é "modo sessão nova", que era a leitura pretendida. O efeito, medido nas
+# sessões 954b670c e 2ae43da5: a Unity nascia lendo "nova" como uma mensagem do
+# dono, não entendia, e respondia no Telegram "🤔 'nova' o quê? Nova conversa,
+# nova tarefa, ou projeto novo?" — uma pergunta que ninguém tinha feito. Pior:
+# gastava um turno inteiro (~19 mil tokens de sessão nova) para produzir esse
+# ruído, e o `state.json` registrava `intent: nova` com estado `blocked`.
+#
+# `claude --bg --channels` sem prompt sobe `(idle — send a prompt to start)`:
+# o servidor do canal nasce igual (verificado em 02/08 — `server.ts` no ar com
+# tty "?"), a sessão fica ociosa e não custa nada até o dono falar. Que é
+# exatamente o que se quer de quem só precisa estar de plantão.
+if [ "$RETOMOU" = "0" ]; then
+  if [ -n "$PROMPT_EXTRA" ]; then
+    subir_sessao --append-system-prompt "$PROMPT_EXTRA" \
+      && log "agente de fundo recriado (ocioso, com instruções)" || log "FALHA ao recriar"
+  else
+    subir_sessao \
+      && log "agente de fundo recriado (ocioso, sem persona)" || log "FALHA ao recriar"
+  fi
 fi

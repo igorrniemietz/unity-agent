@@ -2,7 +2,7 @@
 """Manda o custo do dia no Telegram. Roda por timer, uma vez ao dia.
 
 O `unity-costs` já calcula tudo, mas imprime no terminal com barras e cores — o
-Igor não fica olhando terminal. Aqui vai a versão curta, no formato que ele
+O dono não fica olhando terminal. Aqui vai a versão curta, no formato que ele
 pediu: texto puro, poucas linhas, e detalhe só quando importa.
 
 "Quando importa" é uma regra e não julgamento: só abre o detalhe por componente
@@ -22,7 +22,7 @@ sys.path.insert(0, "/home/reaper/.local/bin")
 
 LEDGER = Path.home() / ".local/share/llm-router"
 PROVIDERS = Path.home() / "infra/llm-router/providers.json"
-DESPACHOS = Path.home() / ".local/share/unity-orquestrador/despachos.jsonl"
+DELEGACOES = Path.home() / ".local/share/unity-orquestrador/delegacoes.jsonl"
 
 
 def carregar_lib():
@@ -69,24 +69,49 @@ def ledger_hoje():
     return por_comp, erros, total
 
 
-def claude_cota():
+def _texto_ai_usagebar(bruto):
+    """Tira as tags Pango do texto do ai-usagebar E o indicador de ritmo
+    (⏸, ⚠ etc.) que o vendor `antigravity` gruda no FIM da string inteira,
+    não amarrado a nenhum placeholder — sobrava sozinho no último campo do
+    `--format` e vazava como `20 ⏸` no lugar de `20`."""
     import re
+    texto = re.sub("<[^>]+>", "", bruto)
+    return re.sub(r"[^\x00-\x7F]+\s*$", "", texto).rstrip()
+
+
+def claude_cota():
     import subprocess
     try:
         p = subprocess.run(
             ["/home/reaper/.local/bin/ai-usagebar", "--vendor", "anthropic",
              "--json", "--format", "{session_pct}|{weekly_pct}"],
             capture_output=True, text=True, timeout=25)
-        return re.sub("<[^>]+>", "", json.loads(p.stdout)["text"]).split("|")
+        partes = _texto_ai_usagebar(json.loads(p.stdout)["text"]).split("|")
+        return partes if len(partes) == 2 else None
     except Exception:
         return None
 
 
-def despachos_hoje():
-    if not DESPACHOS.exists():
+def gemini_cota():
+    """(session_pct, weekly_pct) — ou None se não achar servidor local do
+    Antigravity (app fechado, sem sessão `agy` interativa de pé)."""
+    import subprocess
+    try:
+        p = subprocess.run(
+            ["/home/reaper/.local/bin/ai-usagebar", "--vendor", "antigravity",
+             "--json", "--format", "{session_pct}|{weekly_pct}"],
+            capture_output=True, text=True, timeout=15)
+        partes = _texto_ai_usagebar(json.loads(p.stdout)["text"]).split("|")
+        return partes if len(partes) == 2 else None
+    except Exception:
+        return None
+
+
+def delegacoes_hoje():
+    if not DELEGACOES.exists():
         return 0, 0
     vistos = {}
-    for linha in DESPACHOS.read_text().splitlines():
+    for linha in DELEGACOES.read_text().splitlines():
         try:
             r = json.loads(linha)
         except Exception:
@@ -121,7 +146,8 @@ def montar():
     por_comp, erros, total = ledger_hoje()
     teto = teto_deepseek()
     cota = claude_cota()
-    g, c = despachos_hoje()
+    gcota = gemini_cota()
+    g, c = delegacoes_hoje()
 
     # Toda linha abaixo de ~32 caracteres, de propósito: no Telegram do celular
     # linha maior quebra sozinha e separa número de unidade, que foi a queixa.
@@ -135,6 +161,8 @@ def montar():
 
     if cota:
         linhas.append(f"Claude {cota[0]}% 5h · {cota[1]}% semana")
+    if gcota:
+        linhas.append(f"Gemini {gcota[0]}% 5h · {gcota[1]}% semana")
     linhas.append(f"DeepSeek US$ {brl(total)} de {teto_fmt}")
 
     # O ai-memory sai sempre, mesmo com gasto baixo: é o único componente que
@@ -145,7 +173,7 @@ def montar():
         linhas.append(f"ai-memory US$ {brl(am['usd'])} · "
                       f"{humano(am['tin'] + am['tout'])} tok")
     if g or c:
-        linhas.append(f"Gemini {g} · Claude {c} despachos")
+        linhas.append(f"Gemini {g} · Claude {c} delegações")
 
     # Detalhe por componente só passando de metade do teto — ver o docstring.
     if fracao >= 0.5 and len(por_comp) > 1:

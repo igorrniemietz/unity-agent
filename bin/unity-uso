@@ -8,10 +8,12 @@ Cada número vem da fonte que de fato sabe, e não de estimativa:
 - DEEPSEEK: o ledger do llm-router (~/.local/share/llm-router/<data>.jsonl).
   Melhor que perguntar ao vendor: registra tokens E custo por chamada, já
   separados por componente, e é local (não gasta requisição nem depende de rede).
-- GEMINI: a cota do Antigravity **não é legível aqui**. O ai-usagebar só a
-  obtém enquanto o app ou uma sessão `agy` INTERATIVA estiver de pé, e os
-  despachos são `agy -p` curtos e não-interativos. Então reportamos o que dá
-  para saber com honestidade: quantos despachos foram feitos hoje.
+- GEMINI: `ai-usagebar --vendor antigravity`, mesma fonte do Claude — mas só
+  responde enquanto o app Antigravity ou uma sessão `agy` INTERATIVA estiver
+  de pé (as delegações do dia a dia são `agy -p`, curtas e não-interativas, e
+  não deixam servidor local no ar). Quando responde, mostramos o % da cota,
+  igual ao Claude. Quando não, caímos de volta em quantas delegações foram
+  feitas hoje — o que dá para saber com honestidade nesse caso.
 
 `--linha` imprime o formato compacto de rodapé; sem argumento, imprime o
 detalhado. Nunca levanta exceção: uma fonte muda não pode derrubar a resposta.
@@ -20,12 +22,22 @@ import json
 import re
 import subprocess
 import sys
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 LEDGER = Path.home() / ".local/share/llm-router"
-DESPACHOS = Path.home() / ".local/share/unity-orquestrador/despachos.jsonl"
+DELEGACOES = Path.home() / ".local/share/unity-orquestrador/delegacoes.jsonl"
 USAGEBAR = "/home/reaper/.local/bin/ai-usagebar"
+
+
+def _texto_ai_usagebar(bruto):
+    """Tira as tags Pango do texto do ai-usagebar E o indicador de ritmo
+    (⏸, ⚠ etc.) que o vendor `antigravity` gruda no FIM da string inteira,
+    não amarrado a nenhum placeholder — sobrava sozinho no último campo do
+    `--format` e vazava como `20 ⏸` no lugar de `20`. `anthropic` nunca fez
+    isso nos testes, mas limpar aqui também não muda nada para ele."""
+    texto = re.sub("<[^>]+>", "", bruto)
+    return re.sub(r"[^\x00-\x7F]+\s*$", "", texto).rstrip()
 
 
 def claude():
@@ -35,7 +47,22 @@ def claude():
             [USAGEBAR, "--vendor", "anthropic", "--json",
              "--format", "{session_pct}|{session_reset}|{weekly_pct}|{weekly_reset}"],
             capture_output=True, text=True, timeout=25)
-        texto = re.sub("<[^>]+>", "", json.loads(p.stdout)["text"])
+        texto = _texto_ai_usagebar(json.loads(p.stdout)["text"])
+        partes = texto.split("|")
+        return partes if len(partes) == 4 else None
+    except Exception:
+        return None
+
+
+def gemini_quota():
+    """(pct_5h, reset_5h, pct_7d, reset_7d) — ou None se não achar servidor
+    local do Antigravity (app fechado, sem sessão `agy` interativa de pé)."""
+    try:
+        p = subprocess.run(
+            [USAGEBAR, "--vendor", "antigravity", "--json",
+             "--format", "{session_pct}|{session_reset}|{weekly_pct}|{weekly_reset}"],
+            capture_output=True, text=True, timeout=15)
+        texto = _texto_ai_usagebar(json.loads(p.stdout)["text"])
         partes = texto.split("|")
         return partes if len(partes) == 4 else None
     except Exception:
@@ -60,13 +87,40 @@ def deepseek_hoje():
     return entrada, saida, custo
 
 
+def ai_memory_hoje():
+    """Tokens e custo em USD gastos hoje pelo ai-memory no mesmo roteador.
+
+    É um SUBCONJUNTO do total de `deepseek_hoje()`, não algo à parte — o
+    roteador marca cada chamada com `client` (ver ~/infra/llm-router/router.py,
+    header X-LLM-Client), e o ai-memory é um dos clientes que passam por ele,
+    junto com `supervisor` e `notify`. Existe como função própria porque o dono
+    pediu para ver o custo do ai-memory destacado, e não só somado ao total.
+    """
+    caminho = LEDGER / f"{date.today().isoformat()}.jsonl"
+    entrada = saida = 0
+    custo = 0.0
+    if not caminho.exists():
+        return entrada, saida, custo
+    for linha in caminho.read_text().splitlines():
+        try:
+            r = json.loads(linha)
+        except Exception:
+            continue
+        if r.get("client") != "ai-memory":
+            continue
+        entrada += r.get("prompt_tokens") or 0
+        saida += r.get("completion_tokens") or 0
+        custo += r.get("cost_usd") or 0.0
+    return entrada, saida, custo
+
+
 def gemini_hoje():
-    """Despachos concluídos hoje no nível gemini. Proxy, não cota."""
-    if not DESPACHOS.exists():
+    """Delegações concluídos hoje no nível gemini. Proxy, não cota."""
+    if not DELEGACOES.exists():
         return 0
     hoje = date.today().isoformat()
     vistos = {}
-    for linha in DESPACHOS.read_text().splitlines():
+    for linha in DELEGACOES.read_text().splitlines():
         try:
             r = json.loads(linha)
         except Exception:
@@ -82,36 +136,131 @@ def gemini_hoje():
     return n
 
 
+GEMINI_TOKENS = Path.home() / ".local/share/unity-orquestrador/gemini-tokens.jsonl"
+
+
+def gemini_tokens_hoje():
+    """Soma dos tokens gastos hoje pelo agy (nivel gemini). Numerador sem
+    denominador -- e o proxy que existe enquanto a cota (%) nao esta legivel
+    (Antigravity/agy interativo fechado). Ver registrar_tokens_gemini no
+    unity-delegar, que e quem escreve este ledger."""
+    if not GEMINI_TOKENS.exists():
+        return 0
+    hoje = date.today().isoformat()
+    total = 0
+    for linha in GEMINI_TOKENS.read_text().splitlines():
+        try:
+            r = json.loads(linha)
+        except Exception:
+            continue
+        if date.fromtimestamp(r.get("ts") or 0).isoformat() == hoje:
+            total += r.get("total_tokens") or 0
+    return total
+
+
 def humano(n):
     return f"{n/1000:.1f}k".replace(".0k", "k") if n >= 1000 else str(n)
+
+
+DIAS_PT = ("seg", "ter", "qua", "qui", "sex", "sáb", "dom")
+
+
+def quando_zera(restante, com_dia=False):
+    """'1h 11m' (tempo restante) vira '16h38' (horário em que zera).
+
+    O `ai-usagebar` só sabe dizer QUANTO FALTA, e o dono pediu A HORA
+    (28/09/2026): "coloque o horário que a janela de 5h do claude reseta" e,
+    logo depois, "o dia e o horário que reseta a semanal". Contar de cabeça
+    quanto é "3d 5h" a partir de agora é justamente o trabalho que ele não
+    quer fazer no celular.
+
+    `com_dia=True` prefixa o dia da semana, que é o que faz a janela semanal
+    ser legível — "qui 20h" diz algo, "em 3d 5h" não diz.
+
+    Devolve None se não entender o formato: melhor omitir a hora do que
+    inventar uma. Nunca levanta.
+    """
+    try:
+        d = h = m = 0
+        for valor, unidade in re.findall(r"(\d+)\s*([dhm])", restante or ""):
+            n = int(valor)
+            if unidade == "d":
+                d = n
+            elif unidade == "h":
+                h = n
+            else:
+                m = n
+        if not (d or h or m):
+            return None
+        alvo = datetime.now() + timedelta(days=d, hours=h, minutes=m)
+        if com_dia:
+            # Semanal: o minuto exato é ruído a dias de distância; a hora basta.
+            return f"{DIAS_PT[alvo.weekday()]} {alvo:%Hh}"
+        return f"{alvo:%Hh%M}"
+    except Exception:
+        return None
 
 
 def main():
     compacto = "--linha" in sys.argv
     c = claude()
     din, dout, dcusto = deepseek_hoje()
-    g = gemini_hoje()
+    m_in, m_out, mcusto = ai_memory_hoje()
+    # gemini_hoje/gemini_quota/gemini_tokens_hoje NÃO são mais chamadas (28/09).
+    # Além de o dono ter pedido o Gemini fora, `gemini_quota()` abria uma
+    # conexão com o servidor local do Antigravity a cada execução — e este
+    # comando roda no rodapé de TODA mensagem que eu mando no Telegram. Era
+    # latência paga em toda resposta para imprimir "0 delegação(s)".
 
     if compacto:
-        # DUAS linhas curtas, não uma longa. Medido numa tela de celular: uma
+        # TRÊS linhas curtas, não uma longa. Medido numa tela de celular: uma
         # linha só passava de 80 caracteres e quebrava em três pedaços tortos,
         # com número separado da unidade. Cada linha aqui fica abaixo de ~32
         # caracteres, que é o que cabe sem quebra no Telegram do telefone.
+        #
+        # A linha do ai-memory é SUBCONJUNTO da linha DeepSeek acima, não soma
+        # a ela — os dois números aparecerem próximos é o que o dono pediu
+        # (destacar o custo do ai-memory), não um terceiro total.
+        #
+        # O GEMINI SAIU DAQUI em 28/09/2026, a pedido do dono. A assinatura foi
+        # cancelada em 21/09 e ele reafirmou em 26/09 que não é para usar —
+        # então a contagem de delegações Gemini virou ruído ocupando uma linha
+        # num rodapé que ele lê no celular. O lugar liberado passou a mostrar
+        # QUANDO a janela zera, que é a informação que ele pediu no lugar.
         usd = f"{dcusto:.2f}".replace(".", ",")
-        print(f"📊 Claude {c[0]}% 5h · {c[2]}% 7d" if c else "📊 Claude s/ dado")
-        print(f"DeepSeek US$ {usd} · Gemini {g}")
+        musd = f"{mcusto:.2f}".replace(".", ",")
+        if c:
+            print(f"📊 Claude {c[0]}% 5h · {c[2]}% 7d")
+            z5 = quando_zera(c[1])
+            z7 = quando_zera(c[3], com_dia=True)
+            if z5 and z7:
+                print(f"zera {z5} · sem {z7}")
+            elif z5:
+                print(f"zera {z5}")
+        else:
+            print("📊 Claude s/ dado")
+        print(f"DeepSeek US$ {usd}")
+        print(f"↳ ai-memory US$ {musd}")
         return 0
 
     print("Consumo de hoje\n")
     if c:
-        print(f"  Claude    {c[0]}% da janela de 5h (zera em {c[1]})")
-        print(f"            {c[2]}% da semana (zera em {c[3]})")
+        z5 = quando_zera(c[1])
+        z7 = quando_zera(c[3], com_dia=True)
+        print(f"  Claude    {c[0]}% da janela de 5h"
+              + (f" (zera {z5}, em {c[1]})" if z5 else f" (zera em {c[1]})"))
+        print(f"            {c[2]}% da semana"
+              + (f" (zera {z7}, em {c[3]})" if z7 else f" (zera em {c[3]})"))
     else:
         print("  Claude    sem dado (ai-usagebar não respondeu)")
     print(f"  DeepSeek  {humano(din)} entrada + {humano(dout)} saída = "
           f"US$ {dcusto:.4f}".replace(".", ","))
-    print(f"  Gemini    {g} despacho(s) — cota da assinatura não é legível "
-          f"fora de sessão agy interativa")
+    print(f"    ai-memory  {humano(m_in)} entrada + {humano(m_out)} saída = "
+          f"US$ {mcusto:.4f}".replace(".", ",") + " (incluso no total DeepSeek acima)")
+    # O bloco do Gemini saiu daqui em 28/09/2026 junto com o do rodapé: a
+    # assinatura foi cancelada em 21/09 e a linha só repetia "0 delegação(s)".
+    # As funções gemini_* continuam definidas de propósito — se o dono
+    # reassinar, voltar a exibir é descomentar duas linhas, não reescrever.
     return 0
 
 
