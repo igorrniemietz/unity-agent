@@ -32,6 +32,10 @@ pendentes.
 Obrigatório: Claude Code, Python 3.11+, `bun`, systemd de usuário, e o
 `opencode` (que é a faixa grátis que faz o trabalho longo).
 
+> **Não quer gastar cota com isto?** O trabalho longo pode rodar inteiro em
+> modelo gratuito. Quais existem hoje, como trocar, e o que "grátis" cobra de
+> volta está em **[MODELOS.md](MODELOS.md)**.
+
 Opcional, e o agente vai te oferecer um por um:
 
 | Recurso | O que você ganha | O que precisa |

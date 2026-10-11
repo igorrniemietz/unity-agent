@@ -54,6 +54,19 @@ Depois do `opencode` instalado, ele ainda precisa de login no provedor:
 `opencode auth login`. Isso abre um fluxo interativo — **não tente fazer por
 ele**. Peça que ele rode no terminal e diga quando terminar.
 
+Com o login feito, **confira que o modelo padrão ainda existe**:
+
+```bash
+opencode models | grep mimo
+```
+
+O catálogo gratuito rotaciona sem aviso, e modelo que sai não volta. Se não
+aparecer, escolha outro da lista e diga a ele qual você escolheu e por quê —
+`MODELOS.md` tem a tabela e a variável de ambiente que troca
+(`UNITY_OPENCODE_MODEL`). Não deixe isso para depois: o sintoma de modelo
+inexistente é a delegação morrer em poucos segundos com "Unexpected server
+error", que parece queda do provedor e não é.
+
 ## Passo 2 — rode o instalador
 
 ```bash
@@ -172,6 +185,18 @@ Uma chave em `openrouter.ai`, gravada em `~/.config/unity/openrouter.key`.
 Serve para ter dois executores de custo zero em vez de um — útil porque o
 revisor cruzado usa o modelo da outra faixa. Opcional; sem a chave,
 `--nivel nex` não roda e o `--nivel opencode` cobre tudo.
+
+Se ele ligar esta faixa, confirme que o modelo padrão ainda é gratuito:
+
+```bash
+curl -s https://openrouter.ai/api/v1/models \
+  | python3 -c "import json,sys; [print(m['id']) for m in json.load(sys.stdin)['data'] if m['id'].endswith(':free')]"
+```
+
+Isso já pegou de verdade: em 11/10/2026 a variante `:free` do modelo que dava
+nome à faixa tinha saído do catálogo, enquanto a versão **paga** de mesmo nome
+continuava lá. O nome existia e a faixa grátis não — e o erro não dizia isso.
+`MODELOS.md` tem a tabela de alternativas e a variável `UNITY_NEX_MODEL`.
 
 ### Serviços externos (memória e rodapé de consumo)
 
