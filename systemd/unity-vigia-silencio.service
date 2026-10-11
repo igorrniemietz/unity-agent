@@ -1,5 +1,5 @@
 [Unit]
-Description=Unity — avisa se uma mensagem do Igor ficou sem resposta (qualquer causa)
+Description=Unity — avisa se uma mensagem do dono ficou sem resposta (qualquer causa)
 
 [Service]
 Type=oneshot
