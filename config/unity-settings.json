@@ -33,7 +33,7 @@
       "junto a confirmação de exclusão, a única coisa que o dono quis manter."
     ],
     "defaultMode": "default",
-    "_comment_additionalDirectories": "2026-09-10: a Unity travou 5h esperando aprovacao de `date +%F > /home/reaper/.claude/unity-email-diario.last`. O comando estava liberado (Bash inteiro esta no allow), mas o caminho ABSOLUTO fez o analisador ver escrita fora do workspace (cwd era ~/projetos/um-projeto) e escalar para prompt de permissao -- que numa sessao de fundo nao tem quem responda. Com `~/...` nao expandido isso nunca aconteceu em 10 execucoes anteriores. Declarar ~/.claude aqui tira o diretorio de estado dela do 'fora do workspace'.",
+    "_comment_additionalDirectories": "2026-09-10: a Unity travou 5h esperando aprovacao de `date +%F > /home/reaper/.claude/unity-algum-timer.last`. O comando estava liberado (Bash inteiro esta no allow), mas o caminho ABSOLUTO fez o analisador ver escrita fora do workspace (cwd era ~/projetos/um-projeto) e escalar para prompt de permissao -- que numa sessao de fundo nao tem quem responda. Com `~/...` nao expandido isso nunca aconteceu em 10 execucoes anteriores. Declarar ~/.claude aqui tira o diretorio de estado dela do 'fora do workspace'.",
     "additionalDirectories": [
       "/home/reaper/.claude"
     ],

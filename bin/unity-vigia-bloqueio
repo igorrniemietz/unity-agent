@@ -3,7 +3,7 @@
 
 O ponto cego que custou 5h em 2026-09-10. A Unity chamou
 
-    date +%F > /home/reaper/.claude/unity-email-diario.last
+    date +%F > /home/reaper/.claude/unity-algum-timer.last
 
 às 23:06:56 BRT. Caminho absoluto fora do cwd escalou para prompt de permissão
 mesmo com `Bash` inteiro no allow — e sessão de fundo não tem ninguém no terminal
