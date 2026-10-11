@@ -1,0 +1,1540 @@
+#!/usr/bin/env python3
+"""Delega uma tarefa para um executor, em segundo plano, e avisa no Telegram.
+
+Existe por três motivos medidos:
+
+1. `agy -p` e `claude -p` BLOQUEIAM por 30 a 180 s. Rodados direto no Bash da
+   sessão que é dona do canal do Telegram, eles deixam o bot mudo — o dono manda
+   outra mensagem e não recebe nada, sem erro. Mesmo sintoma da briga de
+   getUpdates que já custou depuração.
+2. O `agy` IGNORA o diretório atual sem `--add-dir`: escreve em
+   ~/.gemini/antigravity-cli/scratch/ e ainda responde "criado com sucesso".
+   Aqui a flag é obrigatória, não opcional.
+3. A restrição de consumidor único do Telegram vale para RECEBER, não para
+   ENVIAR — `unity-lib.send_telegram` faz POST direto na Bot API. Então o processo
+   delegado avisa o dono sozinho, sem precisar que o supervisor esteja
+   acordado nem disputar o canal.
+
+Uso:
+    unity-delegar --nivel claude|sonnet|gemini|opencode|nex \
+        --projeto <nome> --dir <caminho> "<tarefa>"
+    unity-delegar --lista
+
+As cinco faixas, da mais cara para a mais barata:
+
+- `claude`   — Opus 5. Planejar, arquitetura, bug de causa desconhecida.
+- `sonnet`   — Sonnet 5. Mudança com critério sobre alvo conhecido. Mesma
+               assinatura do Opus, peso bem menor na janela de 5 h. Criada em
+               2026-08-01 porque a regra "na dúvida, SOBE" mandava tudo que não
+               era trivial para o Opus, e era isso que esvaziava a janela.
+- `gemini`   — agy (Gemini 3.7 Flash). ASSINATURA CANCELADA em 21/09/2026;
+               a faixa continua no código, mas não é para ser escolhida.
+- `opencode` — o modelo grátis do opencode zen (hoje MiMo v2.6 Flash; era
+               DeepSeek v4 Flash até 24/08/2026, quando saiu do catálogo), fora
+               da cota da Anthropic.
+- `nex`      — Nex N2.5 Pro pela OpenRouter, também grátis, pelo mesmo binário
+               do opencode. Mais lento que o MiMo (raciocina mais), e melhor no
+               que é aberto. Criado em 28/09/2026.
+
+As duas últimas são as faixas GRÁTIS, e são o destino padrão de tudo que é
+simples, repetitivo ou volumoso — o que gastaria cota cara sem exigir critério.
+Elas se revisam: quando uma termina, a outra lê o que foi feito e carimba um
+veredito no aviso do Telegram (ver `revisar_entrega`). Custo zero, e o dono
+para de precisar descobrir sozinho que o executor mentiu.
+"""
+import argparse
+import fcntl
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import uuid
+import zipfile
+from contextlib import contextmanager
+from datetime import datetime
+from pathlib import Path
+
+SPOOL = Path.home() / ".local/share/unity-orquestrador"
+LIB = "/home/reaper/.local/bin/unity-lib.py"
+# Lista de permissão do executor. Fora do script porque é política, não código:
+# mexer em quem pode o quê não deveria exigir editar o despachante.
+DISPATCH_SETTINGS = Path.home() / ".claude/dispatch-settings.json"
+LIMITE_AVISO = 2500  # caracteres do resultado que vão para o chat
+
+# O opencode é instalado em ~/.opencode/bin e ligado por symlink no ~/.local/bin.
+# O `which` cobre o uso normal; o caminho absoluto cobre o systemd, cujo PATH é
+# mínimo e não inclui ~/.local/bin.
+OPENCODE = shutil.which("opencode") or os.path.expanduser("~/.opencode/bin/opencode")
+# O catálogo grátis do opencode zen ROTACIONA, e modelo que sai de lá não volta
+# como erro honesto: o servidor responde `UnknownError / Unexpected server error`
+# em ~5s, que não se distingue de queda do provedor.
+#
+# Medido em 24/08/2026: `deepseek-v4-flash-free` desapareceu do catálogo (só
+# restaram 7 modelos zen, nenhum DeepSeek) e toda delegação --nivel opencode
+# morria nesse erro. Sobreviventes testados com escrita de arquivo de verdade:
+#   mimo-v2.5-free              18s  ✅
+#   hy3-free                    38s  ✅
+#   nemotron-3.5-lightning-free 52s  ✅
+#   nemotron-3-ultra-free      105s  ✅ mas devolveu 502 da Nvidia logo depois
+#   x-preview-f-free, big-pickle     ❌ não terminaram em 150s
+# Padrão é o mais rápido que passou. Se ele sumir também, `opencode models`
+# lista o que existe hoje — a lista acima é de 24/08, não é permanente.
+#
+# 23/09/2026: mimo-v2.5-free girou pra fora do catálogo (virou v2.6) e toda
+# delegação opencode morria em ~5s com "Unexpected server error" sem aviso
+# nenhum no Telegram (o dono só percebeu ao perguntar "cadê?" 37min depois).
+# Atualizado pro nome atual — mas ele PODE girar de novo, então na próxima
+# falha instantânea rode `opencode models` antes de assumir queda do provedor.
+MODELO_OPENCODE = os.environ.get("UNITY_OPENCODE_MODEL",
+                                 "opencode/mimo-v2.6-flash-free")
+
+# Segunda faixa grátis, pedida pelo dono em 28/09/2026: o Nex N2.5 Pro pela
+# OpenRouter, validado em 21/09 (construiu um site marketplace inteiro do zero).
+# Roda pelo MESMO binário do opencode — muda só o `--model` e a credencial.
+#
+# Ter DUAS faixas grátis não é redundância: o catálogo zen rotaciona sem aviso
+# (ver o histórico acima), e até hoje o dia em que o modelo saía era o dia em
+# que a delegação barata inteira parava. Agora uma cobre a outra. E o revisor
+# cruzado (`revisar_entrega`) precisa de dois modelos diferentes para existir:
+# modelo revisando a si mesmo aprova o próprio erro.
+MODELO_NEX = os.environ.get("UNITY_NEX_MODEL",
+                            "openrouter/nex-agi/nex-n2.5-pro:free")
+
+# Onde a chave da OpenRouter pode estar. O despachante LÊ, mas nunca imprime:
+# a Unity não é o lugar onde chave de API mora, e o hook que bloqueia acesso a
+# segredo está certo em barrá-la — por isso a busca acontece aqui dentro, em
+# tempo de execução, e o valor nunca sai em log, em erro ou no Telegram.
+CRED_OPENROUTER = Path.home() / ".config/unity/openrouter.key"
+ENV_LLM_ROUTER = Path.home() / "infra/llm-router/.env"
+
+
+def chave_openrouter():
+    """A chave da OpenRouter, ou None. Nunca devolve pedaço dela em mensagem.
+
+    Três lugares, nesta ordem: a variável de ambiente (quem chama já resolveu),
+    um arquivo dedicado, e o `.env` do llm-router (onde as outras chaves desta
+    casa já moram, então é o lugar que o dono espera).
+    """
+    k = (os.environ.get("OPENROUTER_API_KEY") or "").strip()
+    if k:
+        return k
+    try:
+        if CRED_OPENROUTER.is_file():
+            k = CRED_OPENROUTER.read_text().strip()
+            if k:
+                return k
+    except Exception:
+        pass
+    try:
+        for linha in ENV_LLM_ROUTER.read_text().splitlines():
+            linha = linha.strip()
+            if linha.startswith("OPENROUTER_API_KEY="):
+                k = linha.split("=", 1)[1].strip().strip("'\"")
+                if k:
+                    return k
+    except Exception:
+        pass
+    return None
+
+
+# Gemini 3.7 Flash Medium desde 15/08/2026 (era 3.6). Sai por variável porque
+# trocar de modelo é rotina e não deveria exigir editar o despachante.
+MODELO_GEMINI = os.environ.get("UNITY_GEMINI_MODEL", "gemini-3.7-flash-medium")
+
+# Rótulo humano de cada faixa, para o aviso no Telegram.
+#
+# O da faixa `opencode` é DERIVADO do modelo, não escrito à mão. Ficou escrito
+# "DeepSeek (opencode)" de 24/08 a 10/09/2026, mesmo depois de o DeepSeek sair
+# do catálogo zen e o padrão virar `mimo-v2.5-free` — então todo relatório dizia
+# DeepSeek enquanto rodava MiMo. Em 09/09 o dono cobrou "pedi para não usar o
+# DeepSeek no pico e ele rodou": não rodou, mas o rótulo dizia que sim, e rótulo
+# é a única coisa que ele vê. Nome de modelo é rotina de trocar; rótulo à mão
+# envelhece calado e vira mentira.
+def _rotulo_opencode(modelo=None):
+    m = (modelo or MODELO_OPENCODE).split("/")[-1]
+    if m.endswith("-free"):
+        m = m[:-len("-free")] + " (grátis)"
+    return f"{m} via opencode"
+
+
+def _rotulo_nex(modelo=None):
+    m = (modelo or MODELO_NEX).split("/")[-1].replace(":free", " (grátis)")
+    return f"{m} via OpenRouter"
+
+
+EXECUTORES = {
+    "claude": "Claude Opus",
+    "sonnet": "Claude Sonnet",
+    "gemini": "Gemini",
+    "opencode": _rotulo_opencode(),
+    "nex": _rotulo_nex(),
+}
+
+# As duas faixas que custam zero e rodam pelo binário do opencode. Andam
+# sempre juntas: quem serializa a trava, quem revisa quem, e para onde as
+# faixas pagas são rebaixadas — tudo se decide por esta tupla.
+FAIXAS_GRATIS = ("opencode", "nex")
+
+# Quem revisa quem. Revisor cruzado, nunca o próprio executor: pedido do dono
+# em 28/09/2026 ("revisar o que fizeram em seguida"), e também o único desenho
+# que funciona — um modelo relendo o próprio trabalho tende a confirmá-lo.
+REVISOR_DE = {"opencode": "nex", "nex": "opencode"}
+# Revisor de última hora, para quando a chave da OpenRouter ainda não estiver
+# no lugar. É outro grátis do catálogo zen — não é tão bom quanto o Nex, mas
+# "sem revisor nenhum" é o estado que estamos consertando.
+MODELO_REVISOR_RESERVA = os.environ.get("UNITY_MODELO_REVISOR_RESERVA",
+                                        "opencode/ling-3.0-flash-fin-free")
+# A revisão é conferência, não uma segunda tarefa: relógio curto de propósito.
+# Se ela não couber no tempo, a entrega sai sem veredito em vez de atrasar.
+TIMEOUT_REVISAO = int(os.environ.get("UNITY_TIMEOUT_REVISAO", "420"))
+
+# Onde o `unity-ensure` grava qual modo está no ar. Fonte única: ele é o árbitro.
+MODO_ARQ = Path.home() / ".local/share/unity-supervisor/modo"
+
+# As faixas que consomem cota da Anthropic. No modo econômico não há cota — é
+# esse o motivo de o modo existir.
+FAIXAS_PAGAS = ("claude", "sonnet")
+
+
+def rebaixar_no_modo_economico(nivel):
+    """No modo econômico, faixa paga vira `gemini`. Trava de ferramenta, não de prompt.
+
+    O AGENTS.md do modo econômico já mandava, com todas as letras, não delegar
+    para `claude` nem para `sonnet`. Não bastou: medido em 02/08, o DeepSeek
+    escolheu `sonnet` para uma tarefa de front-end porque o `roteamento.md`
+    manda escalar de Gemini para Sonnet quando o critério é aberto — uma regra
+    mais específica, e que aparece depois no prompt, vencendo a proibição.
+
+    Discutir prioridade de regra com um modelo pequeno é discussão que se perde
+    às vezes, e "às vezes" aqui significa queimar a cota que o modo econômico
+    existe para preservar. Então a decisão sai do prompt e entra no despachante:
+    aqui não tem como não obedecer.
+
+    Rebaixa em vez de recusar porque recusar não entrega nada — e o que o dono
+    pediu foi justamente que o trabalho saísse. Avisa no stdout, que é o que a
+    Unity lê de volta e repassa no Telegram: troca silenciosa de executor seria
+    pior que a proibição ignorada.
+
+    28/09/2026: o destino era `gemini`. A assinatura do Gemini foi cancelada em
+    21/09 e o dono reafirmou em 26/09, com irritação, que não é para usá-lo —
+    então este desvio mandava, calado, a faixa de emergência para um executor
+    que pode simplesmente não atender. Passa a cair em `opencode`, que custa
+    zero e está de pé. O nome da rota continua sendo o modo econômico; o que
+    muda é ela levar a algum lugar.
+    """
+    if nivel not in FAIXAS_PAGAS:
+        return nivel
+    try:
+        modo = MODO_ARQ.read_text().strip()
+    except Exception:
+        return nivel   # sem leitura do modo, não invento restrição
+    if modo != "economico":
+        return nivel
+    print(f"[modo econômico] --nivel {nivel} rebaixado para opencode: "
+          f"não há cota do Claude agora. Diga isto ao dono.")
+    return "opencode"
+
+
+# Janelas de pico da DeepSeek, em hora UTC, válidas a partir de 16/08/2026
+# 16:00 UTC (api-docs.deepseek.com/quick_start/pricing). Fora delas o preço cai
+# à metade. Guardadas como (início, fim) com fim exclusivo.
+PICO_DEEPSEEK_UTC = ((1, 4), (6, 10))
+
+
+def em_pico_deepseek(agora=None):
+    """True se AGORA cai numa janela de pico da DeepSeek (hora UTC)."""
+    h = (agora or datetime.utcnow()).hour
+    return any(ini <= h < fim for ini, fim in PICO_DEEPSEEK_UTC)
+
+
+def desviar_no_pico(nivel, forcar=False):
+    """No pico da DeepSeek, `opencode` pago vira `gemini`. Trava de ferramenta.
+
+    Em 16/08/2026 a DeepSeek passou a cobrar por faixa horária: v4-flash saiu de
+    US$0,28/1M de saída para US$1,32 no pico e US$0,66 fora dele — ou seja, até
+    o preço "com desconto" é mais caro que o de antes. As janelas de pico são
+    01:00–04:00 e 06:00–10:00 UTC, que em Brasília caem de madrugada (22h–01h e
+    03h–07h): quase todo trabalho diurno do dono já é fora de pico, e o que
+    tenta rodar no pico é justamente o que ele não está vendo.
+
+    O desvio só vale para modelo PAGO. O padrão desta casa é o
+    `deepseek-v4-flash-free` do opencode zen, que custa zero e portanto não tem
+    pico — bloquear ali seria travar por causa do nome da faixa, não do que ela
+    cobra. O discriminador é o modelo, não o `--nivel`.
+
+    Rebaixa em vez de recusar, pelo mesmo motivo do modo econômico: recusar não
+    entrega nada, e o Gemini já vem incluso na assinatura.
+    """
+    if nivel != "opencode" or forcar:
+        return nivel
+    if not em_pico_deepseek():
+        return nivel
+    # Até 10/09/2026 havia aqui um `if MODELO_OPENCODE.endswith("-free"): return`
+    # — "grátis não tem pico". O raciocínio era só de custo, e o pedido do dono
+    # não é só de custo: ele pediu para NÃO rodar DeepSeek nessa faixa, ponto.
+    # Enquanto o padrão foi `mimo-v2.5-free` a isenção não fez estrago (nenhum
+    # DeepSeek rodou no pico), mas ela estava armada: o dia em que um
+    # `deepseek-*-free` voltasse ao catálogo zen, o desvio deixaria passar.
+    # Agora o discriminador é a IDENTIDADE do modelo, não o preço dele.
+    if "deepseek" not in MODELO_OPENCODE.lower():
+        return nivel   # não é DeepSeek: a janela não diz respeito a este modelo
+    motivo = ("é grátis, mas o dono pediu para não usá-lo nessa faixa"
+              if MODELO_OPENCODE.endswith("-free") else "custa o dobro")
+    # 28/09/2026: o desvio era para `gemini`, cancelado desde 21/09. Agora vai
+    # para `nex`, a outra faixa grátis — que é OpenRouter, não DeepSeek, e
+    # portanto não tem nada a ver com esta janela de pico. Mesmo motivo do
+    # rebaixamento do modo econômico: desviar para um executor morto é pior que
+    # não desviar, porque a falha chega como erro de tarefa, não como política.
+    print(f"[pico DeepSeek] --nivel opencode desviado para nex: "
+          f"{MODELO_OPENCODE} {motivo}, entre 01:00-04:00 e 06:00-10:00 UTC "
+          f"(22h-01h e 03h-07h BRT). Use --forcar-pico se for urgente.")
+    return "nex"
+
+
+def carregar_lib():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("unity_lib", LIB)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def registrar(entrada):
+    SPOOL.mkdir(parents=True, exist_ok=True)
+    with open(SPOOL / "delegacoes.jsonl", "a") as fh:
+        fh.write(json.dumps(entrada, ensure_ascii=False) + "\n")
+
+
+GEMINI_TOKENS = SPOOL / "gemini-tokens.jsonl"
+
+
+def registrar_tokens_gemini(ident, projeto, usage):
+    """Numerador sem denominador: quanto o agy gastou nesta chamada.
+
+    Nao da para calcular % da cota (o total da janela so o servidor local do
+    Antigravity conhece), mas pelo menos fica o registro de token gasto por
+    delegacao, igual ja existe para o DeepSeek no ledger do llm-router. Falha
+    aqui e cosmetica -- nunca pode derrubar a delegacao.
+    """
+    try:
+        SPOOL.mkdir(parents=True, exist_ok=True)
+        with open(GEMINI_TOKENS, "a") as fh:
+            fh.write(json.dumps({
+                "id": ident, "projeto": projeto, "ts": time.time(),
+                "input_tokens": usage.get("input_tokens") or 0,
+                "output_tokens": usage.get("output_tokens") or 0,
+                "thinking_tokens": usage.get("thinking_tokens") or 0,
+                "total_tokens": usage.get("total_tokens") or 0,
+            }, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def vivo(pid):
+    """O processo ainda existe? Sinal 0 não mata, só pergunta."""
+    if not pid:
+        return None       # None = "não sei", diferente de False = "morreu"
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True       # existe, só não é meu — conta como vivo
+    except Exception:
+        return None
+
+
+def ativos():
+    """Delegações que começaram e não terminaram, por diretório.
+
+    Dois agentes escrevendo no mesmo repositório é a única concorrência que
+    corrompe — duas tarefas em projetos diferentes podem rodar juntas à vontade.
+
+    O estado "rodando" sozinho NÃO basta como prova de vida. Ele é escrito no
+    despacho e só é substituído por "terminado" no fim do `executar()`; se o
+    filho morrer no meio — cgroup do systemd derrubando o serviço que o lançou,
+    reboot, OOM, kill —, ninguém escreve o fim e a entrada fica "rodando" para
+    sempre. Como o `main()` recusa despachar num diretório que já tem delegação
+    ativa, uma única morte dessas tranca o projeto de forma permanente.
+
+    Medido em 03/08/2026: a delegação 56b1d81a (gemini -> jobcraft) morreu às
+    00:08 e às 10:48 ainda bloqueava todo despacho para `~/projetos/jobcraft`.
+    Do lado do dono isso aparece como a Unity "esperando aprovação" de algo que
+    não existe mais.
+
+    Duas provas de vida, nesta ordem:
+      1. o PID anotado no despacho — resposta exata, quando existe;
+      2. relógio, para entradas antigas sem PID: passou do timeout com folga,
+         está morta. Um agente não roda mais que o próprio limite.
+    """
+    caminho = SPOOL / "delegacoes.jsonl"
+    if not caminho.exists():
+        return {}
+    estado = {}
+    for linha in caminho.read_text().splitlines():
+        try:
+            r = json.loads(linha)
+        except Exception:
+            continue
+        estado[r["id"]] = r
+
+    agora = time.time()
+    vivas = {}
+    for i, r in estado.items():
+        if r.get("estado") != "rodando":
+            continue
+        v = vivo(r.get("pid"))
+        if v is False:
+            continue
+        if v is None:
+            # Sem PID legível: cai para o relógio. A folga de 120 s cobre o
+            # intervalo entre o executor estourar o timeout e o filho conseguir
+            # registrar o fim.
+            limite = r.get("timeout") or 1800
+            if agora - r.get("iniciado_em", 0) > limite + 120:
+                continue
+        vivas[i] = r
+    return vivas
+
+
+def listar():
+    vivos = ativos()
+    if not vivos:
+        print("nenhuma delegação em andamento")
+        return 0
+    for i, r in vivos.items():
+        inicio = datetime.fromtimestamp(r["iniciado_em"]).strftime("%H:%M:%S")
+        print(f"{i}  {r['nivel']:7s} {r['projeto']:22s} desde {inicio}  {r['tarefa'][:50]}")
+    return 0
+
+
+def _texto_puro(texto):
+    """Tira sintaxe markdown que o Telegram mostra crua — asterisco, crase,
+    cerquilha. Barato e sem rede, é o piso mínimo mesmo quando o resumo por
+    LLM abaixo não roda."""
+    texto = re.sub(r"```[a-zA-Z]*\n?", "", texto)
+    texto = texto.replace("```", "")
+    texto = re.sub(r"(\*\*|__)(.*?)\1", r"\2", texto, flags=re.S)
+    texto = texto.replace("`", "")
+    texto = re.sub(r"(?m)^#{1,6}\s*", "", texto)
+    return texto
+
+
+# Extensões que o dono pede para RECEBER, não para ler o relatório sobre.
+# Deliberadamente não inclui código: um projeto normal muda dezenas de .py/.ts
+# por delegação, e anexar isso vira spam. Aqui é só entregável de consumo final.
+ENTREGAVEIS = {".pdf", ".docx", ".xlsx", ".pptx", ".csv", ".odt", ".ods",
+               ".png", ".jpg", ".jpeg", ".webp", ".svg", ".gif",
+               ".zip", ".mp4", ".mp3", ".wav", ".epub",
+               # .html entrou em 10/09/2026. A lista nasceu em 19/08 pensando em
+               # "documento pronto" e o remendo daquele dia so cobriu esse
+               # formato -- entao em 09/09 o site do Cliente B ficou pronto as 23:08,
+               # o aviso saiu, e o arquivo nunca saiu do disco. Nesta casa site E
+               # entrega: era o buraco de "anunciar nao e entregar" ainda aberto,
+               # so que para o formato que o dono mais pede.
+               ".html", ".htm"}
+TETO_ANEXO = 45 * 1024 * 1024      # a Bot API corta em 50 MB; folga de 5
+MAX_ANEXOS = 3
+
+
+def artefatos_novos(diretorio, desde):
+    """Arquivos de entrega criados/alterados pela delegação, mais novo primeiro.
+
+    Existe porque em 19/08/2026 o dono pediu "monta pra mim um PDF", o Gemini
+    entregou em 4m19s, e a notificação disse só "terminou em 259s" — texto puro,
+    sem o arquivo. Ele ficou uma hora esperando um PDF que já estava no disco.
+    Anunciar não é entregar.
+    """
+    achados = []
+    try:
+        base = Path(diretorio)
+        for f in base.rglob("*"):
+            try:
+                if not f.is_file() or f.suffix.lower() not in ENTREGAVEIS:
+                    continue
+                st = f.stat()
+                if st.st_mtime < desde or st.st_size > TETO_ANEXO or st.st_size == 0:
+                    continue
+                # Lixo de build e dependência não é entrega.
+                if any(parte in {".git", "node_modules", "__pycache__", ".venv",
+                                 "dist", "build"} for parte in f.parts):
+                    continue
+                achados.append((st.st_mtime, f))
+            except OSError:
+                continue
+    except Exception:
+        return []
+    achados.sort(reverse=True)
+    _EMPACOTADOS.clear()      # o mapa e por delegacao, nao acumulativo
+
+    # Empacota os sites primeiro e so depois escolhe os 3: um asset que ja viajou
+    # dentro do zip nao volta como anexo solto. Sem isto o dono recebia
+    # `versao-a.zip` e `logo.png` na sequencia, e o segundo era pedaco do primeiro.
+    saida, dentro_de_zip = [], set()
+    for _, f in achados:
+        item = _empacotar_se_site(f)
+        if item is not f:                       # virou zip: some o que foi junto
+            # `get`, nao `pop`: o mapa sobrevive para o `produzidos_sem_anexo`
+            # saber que esses arquivos JA viajaram dentro do zip.
+            dentro_de_zip |= _EMPACOTADOS.get(item, set())
+        elif f.resolve() in dentro_de_zip:
+            continue
+        if item not in saida:
+            saida.append(item)
+        if len(saida) >= MAX_ANEXOS:
+            break
+    return [f for f in saida if f.resolve() not in dentro_de_zip or f.suffix == ".zip"]
+
+
+# Extensoes que um site de uma pagina puxa por caminho relativo.
+ACOMPANHA_HTML = {".css", ".js", ".png", ".jpg", ".jpeg", ".webp", ".svg",
+                  ".gif", ".ico", ".woff", ".woff2", ".ttf", ".otf", ".json",
+                  ".mp4", ".webm", ".mp3"}
+TETO_SITE = 40 * 1024 * 1024
+# Quais arquivos ja viajaram dentro de cada zip, para nao anexa-los de novo.
+_EMPACOTADOS = {}
+
+
+def _empacotar_se_site(f):
+    """Um .html com assets relativos vira .zip; qualquer outro arquivo passa direto.
+
+    Mandar o index.html sozinho seria repetir a meia-entrega por outro caminho:
+    ele abre com todas as imagens quebradas, porque `src="assets/logo.png"` nao
+    existe na pasta de downloads. O que se entrega e o site, nao o arquivo.
+    """
+    if f.suffix.lower() not in (".html", ".htm"):
+        return f
+    try:
+        texto = f.read_text(errors="replace")
+    except OSError:
+        return f
+    # So caminho relativo local interessa: http(s):, //cdn, data:, #ancora e
+    # mailto:/tel: nao viajam junto porque nao estao no disco.
+    refs = re.findall(r"""(?:src|href)\s*=\s*["']([^"'#][^"']*)["']""", texto)
+    base = f.parent
+    juntos = []
+    for r in refs:
+        if re.match(r"^(?:[a-zA-Z][\w+.-]*:|//)", r):
+            continue
+        alvo = (base / r.split("?")[0].split("#")[0])
+        if alvo.is_file() and alvo.suffix.lower() in ACOMPANHA_HTML:
+            juntos.append(alvo)
+    if not juntos:
+        return f   # pagina autocontida: o proprio .html ja e a entrega
+
+    try:
+        raiz = Path(tempfile.mkdtemp(prefix="unity-site-"))
+        destino = raiz / f"{base.name or f.stem}.zip"
+        vistos = set()
+        total = 0
+        with zipfile.ZipFile(destino, "w", zipfile.ZIP_DEFLATED) as z:
+            for arq in [f] + juntos:
+                arq = arq.resolve()
+                if arq in vistos or not arq.is_file():
+                    continue
+                try:
+                    rel = arq.relative_to(base.resolve())
+                except ValueError:
+                    rel = Path(arq.name)   # asset fora da pasta: entra na raiz
+                total += arq.stat().st_size
+                if total > TETO_SITE:
+                    break
+                z.write(arq, Path(base.name or "site") / rel)
+                vistos.add(arq)
+        if not destino.stat().st_size:
+            return f
+        _EMPACOTADOS[destino] = vistos
+        return destino
+    except Exception:
+        return f   # empacotar falhou: melhor o .html sozinho que nada
+
+
+IGNORA_SEMPRE = {".git", "node_modules", "__pycache__", ".venv", "dist",
+                 "build", ".next", ".cache", "artefatos-gemini"}
+
+
+def produzidos_sem_anexo(diretorio, desde, anexados):
+    """O que a delegação criou e NÃO foi anexado. Torna a omissão visível.
+
+    A lição de 10/09/2026: `ENTREGAVEIS` é lista branca, e lista branca não
+    erra — ela OMITE, em silêncio, e omissão não aparece em log nenhum. O site
+    do Cliente B ficou pronto às 23:08 de 09/09, o aviso saiu dizendo "terminou em
+    189s" (tecnicamente correto) e o arquivo nunca saiu do disco, porque
+    `.html` não estava na lista. O dono só descobriu no dia seguinte.
+
+    Acrescentar `.html` fecha ESSE caso. Esta função fecha a CLASSE: qualquer
+    formato que a lista ainda não conheça aparece nomeado no aviso, e o buraco
+    seguinte se anuncia sozinho em vez de esperar o dono reclamar.
+    """
+    dentro = set()
+    for a in anexados:
+        dentro.add(a.resolve())
+        dentro |= {x.resolve() for x in _EMPACOTADOS.get(a, set())}
+    sobrando = []
+    try:
+        base = Path(diretorio)
+        for f in base.rglob("*"):
+            try:
+                if not f.is_file() or f.name.startswith("."):
+                    continue
+                if any(parte in IGNORA_SEMPRE for parte in f.parts):
+                    continue
+                st = f.stat()
+                if st.st_mtime < desde or st.st_size == 0:
+                    continue
+                if f.resolve() in dentro:
+                    continue
+                sobrando.append(f.relative_to(base))
+            except OSError:
+                continue
+    except Exception:
+        return []
+    return sorted(sobrando)[:8]
+
+BRAIN = Path.home() / ".gemini/antigravity-cli/brain"
+
+
+def _escrituracao_agy(nome):
+    """O arquivo e papelada interna do agy, nao entrega?
+
+    O diretorio de artefatos guarda, junto do trabalho, o transcript da conversa
+    e um `.metadata.json` por arquivo. Ate 24/08 o resgate so rodava em falha
+    (rara), entao esse lixo passava despercebido; agora ele roda em TODA
+    delegacao gemini, e sem filtro cada uma despeja 3 arquivos de contabilidade
+    no projeto do dono.
+    """
+    return (nome.startswith("transcript")
+            or nome.endswith(".metadata.json")
+            or re.fullmatch(r"\d{8}\.jsonl", nome) is not None)
+
+
+def resgatar_artefatos_agy(conv, destino, desde):
+    """Copia para o projeto o que o agy escreveu no diretorio de artefatos dele.
+
+    Medido em 21/08/2026: o agy NAO escreve fora de
+    `~/.gemini/antigravity-cli/brain/<conversation_id>/`, mesmo com `--add-dir`.
+    A tarefa morre com "is not a valid artifact path" DEPOIS de fazer o
+    trabalho — 397 mil tokens de curadoria ficaram prontos e inalcancaveis, e a
+    delegacao voltou como falha total.
+
+    Entao: falhou ou nao, varre o brain daquela conversa e traz o que ele
+    produziu. Trabalho caro nao pode ficar preso porque o ultimo passo (gravar
+    no caminho certo) foi barrado.
+
+    Recebe o `conversation_id` PRONTO em vez de redescobri-lo: quem chama ja o
+    extraiu do JSON do agy, e no sucesso aquele JSON nao existe mais (virou
+    texto). Ver o comentario na chamada.
+    """
+    if not conv:
+        return []
+    origem = BRAIN / conv
+    if not origem.is_dir():
+        return []
+    alvo = Path(destino) / "artefatos-gemini" / conv[:8]
+    trazidos = []
+    try:
+        alvo.mkdir(parents=True, exist_ok=True)
+        for f in origem.rglob("*"):
+            try:
+                if not f.is_file() or f.stat().st_mtime < desde or f.stat().st_size == 0:
+                    continue
+                if _escrituracao_agy(f.name):
+                    continue
+                shutil.copy2(f, alvo / f.name)
+                trazidos.append(f.name)
+            except Exception:
+                continue
+    except Exception:
+        return []
+    return trazidos
+
+def resumir_para_telegram(saida, lib):
+    """O que chega no Telegram: texto puro, curto, em português.
+
+    Medido: `agy` e `opencode` recebem a instrução de entregar resumo curto
+    em pt-BR (ver RODAPE em `executar`), mas nem sempre obedecem — o relatório
+    completo do que mexeram, em markdown, com cabeçalho e lista, aparecia cru
+    no chat. Pedir de novo no prompt não bastava, então o filtro é aqui: só
+    limpa a formatação quando o relatório já é curto; acima de 400 caracteres,
+    manda para um resumo por LLM (o roteador escolhe o provedor mais barato).
+
+    Nunca deixa a notificação travada por causa disso: se o roteador falhar,
+    volta o texto limpo (sem markdown) e cortado, que já é bem melhor que o
+    bruto.
+    """
+    limpo = _texto_puro(saida).strip()
+    if len(limpo) <= 400:
+        return limpo
+    resumo, _ = lib.llm(
+        "Resuma o relatório abaixo em até 4 linhas curtas, em português do "
+        "Brasil, texto puro — sem markdown (sem **negrito**, sem `crase`, "
+        "sem #, sem listas com traço). Diga só o que mudou de fato, para "
+        "alguém que não vai ler o código, só o resultado final.\n\n" + limpo,
+        # 900, nao 250: o raciocinio do deepseek-v4-flash sozinho ja passa
+        # de 250 neste prompt (medido 250/250 com texto vazio em 05/09/2026),
+        # e ai o resumo caia calado para o texto bruto.
+        client="unity-delegar", max_tokens=900)
+    bruto = resumo and _texto_puro(resumo).strip()
+    texto = bruto or limpo
+    return texto if len(texto) <= LIMITE_AVISO else texto[:LIMITE_AVISO] + "\n… (cortado)"
+
+
+def _progresso(texto):
+    """Uma linha no log da delegação, com hora. O stdout deste processo JÁ é o
+    `{ident}.log` (o pai o abriu e redirecionou), então `print` basta."""
+    print(f"{datetime.now():%H:%M:%S}  {texto}", flush=True)
+
+
+def _resumo_ferramenta(nome, entrada):
+    """`Bash: move Documents para Documentos` — o que ele está fazendo agora.
+
+    Prefere `description` (frase pronta, escrita pelo próprio executor) e só
+    cai no argumento cru quando não há. Trunca porque o heartbeat corta em 180
+    e uma linha de comando inteira empurraria o resto para fora.
+    """
+    if not isinstance(entrada, dict):
+        return nome
+    for chave in ("description", "file_path", "path", "pattern",
+                  "command", "url", "prompt", "query"):
+        valor = entrada.get(chave)
+        if isinstance(valor, str) and valor.strip():
+            return f"{nome}: {' '.join(valor.split())[:120]}"
+    return nome
+
+
+def _consumir_evento(linha, final):
+    """Traduz um evento do `--output-format stream-json` em linha de progresso.
+
+    Só interessam dois tipos: `assistant` (de onde saem os `tool_use`, que são
+    o que o dono quer ver) e `result` (o veredito, guardado em `final` para o
+    chamador). Todo o resto — hook_started, thinking_tokens, rate_limit_event —
+    é ruído de máquina e fica de fora do log de propósito.
+    """
+    try:
+        d = json.loads(linha)
+    except Exception:
+        return
+    tipo = d.get("type")
+    if tipo == "assistant":
+        for bloco in (d.get("message", {}) or {}).get("content") or []:
+            if not isinstance(bloco, dict):
+                continue
+            if bloco.get("type") == "tool_use":
+                _progresso(_resumo_ferramenta(bloco.get("name", "?"),
+                                              bloco.get("input")))
+            elif bloco.get("type") == "text":
+                texto = " ".join((bloco.get("text") or "").split())
+                if texto:
+                    _progresso(f"diz: {texto[:120]}")
+    elif tipo == "result":
+        final["result"] = d
+
+
+def rodar_com_progresso(cmd, cwd, env, timeout, stream_json):
+    """Roda o executor ESCREVENDO progresso enquanto ele trabalha.
+
+    Existe porque até 04/09/2026 isto era `subprocess.run(capture_output=True)`,
+    que só devolve texto quando o processo morre. Consequência medida naquele
+    dia: os 159 arquivos `{ident}.log` do spool estavam TODOS com 0 byte, sem
+    exceção — inclusive os de delegação que terminou bem. O `ultima_linha_log()`
+    do unity-heartbeat lê justamente esses arquivos para contar ao dono o que
+    está rodando, então o aviso de 5 em 5 min só conseguia dizer
+    "organizacao-pc (claude, 3a969df9) — 5min rodando" e nunca o QUÊ. O pedido
+    dele era exatamente esse: "para eu saber o que ela está fazendo".
+
+    Devolve `(saida, ok)` com a mesma semântica do `subprocess.run` que
+    substituiu — quem chama não muda.
+    """
+    proc = subprocess.Popen(cmd, cwd=cwd, env=env, text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            stdin=subprocess.DEVNULL, bufsize=1)
+    bruto = []
+    final = {}
+
+    def bombear():
+        # Thread separada de propósito: quem espera é o `proc.wait(timeout=)` lá
+        # embaixo. Se o relógio fosse checado aqui dentro do laço, um executor
+        # que trava sem imprimir nada nunca seria interrompido — o laço ficaria
+        # bloqueado no `readline` e o timeout jamais chegaria a valer.
+        try:
+            for linha in proc.stdout:
+                bruto.append(linha)
+                if stream_json:
+                    _consumir_evento(linha, final)
+        except Exception:
+            pass
+
+    t = threading.Thread(target=bombear, daemon=True)
+    t.start()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        t.join(timeout=5)
+        raise
+    t.join(timeout=10)
+
+    r = final.get("result")
+    if stream_json and r is not None:
+        saida = (r.get("result") or "").strip()
+        ok = proc.returncode == 0 and not r.get("is_error")
+        if not saida and not ok:
+            saida = f"executor terminou com erro ({r.get('subtype') or '?'})"
+    else:
+        # gemini/opencode, ou stream-json que morreu antes do veredito: vale o
+        # texto cru, igual antes.
+        saida = "".join(bruto).strip()
+        ok = proc.returncode == 0
+        if stream_json:
+            ok = False
+            saida = saida[-2000:] or "executor morreu sem emitir resultado"
+    _progresso(("✅ terminou" if ok else "🔴 falhou"))
+    return saida, ok
+
+
+# O opencode guarda estado de sessão num sqlite dele. Dois processos opencode
+# ao mesmo tempo batem no mesmo banco e um deles morre com "database is locked"
+# — não é conflito de arquivo do projeto (esse já é barrado por diretório lá no
+# main()), é conflito de ESTADO DA FERRAMENTA, e acontece mesmo entre projetos
+# diferentes. Então a serialização é global, uma trava só para todo opencode.
+LOCK_OPENCODE = SPOOL / "opencode.lock"
+
+
+@contextmanager
+def trava_opencode(nivel):
+    """Serializa a invocação do opencode. Só para essa faixa; as outras passam.
+
+    Fica AQUI, dentro do processo filho e colada no subprocesso, e não no
+    `main()`: o `main()` retorna assim que solta o filho em segundo plano, então
+    travar lá não serializaria nada — só o instante do despacho.
+
+    Espera em vez de recusar: a segunda delegação entra na FILA. Recusar
+    devolveria erro para algo que só precisava de mais um minuto, e o dono
+    perderia o trabalho por uma coincidência de horário. O log diz que está
+    esperando, porque log parado sem explicação é indistinguível de travado.
+
+    Cobre as DUAS faixas grátis. O `nex` roda pelo mesmo binário do opencode e
+    portanto pelo mesmo `opencode.db` — a concorrência que devolve "database is
+    locked" é do banco, não do modelo. Deixar o nex fora da trava recriaria em
+    dois dias o mesmo erro de 02/09/2026, agora com a aparência de "o Nex não
+    funciona".
+    """
+    if nivel not in FAIXAS_GRATIS:
+        yield
+        return
+    SPOOL.mkdir(parents=True, exist_ok=True)
+    fh = open(LOCK_OPENCODE, "a+")
+    try:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            _progresso("⏳ outra delegação opencode está rodando — entrando na "
+                       f"fila da trava {LOCK_OPENCODE}. Não travou: é espera.")
+            desde = time.time()
+            fcntl.flock(fh, fcntl.LOCK_EX)      # BLOQUEIA até chegar a vez
+            _progresso(f"🔓 trava do opencode liberada após "
+                       f"{int(time.time() - desde)}s na fila")
+        yield
+    finally:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+        finally:
+            fh.close()
+
+
+def _saida_comando(cmd, timeout=20):
+    """Roda um comando de leitura e devolve o que ele falou, sem levantar."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                           stdin=subprocess.DEVNULL)
+        texto = ((r.stdout or "") + (r.stderr or "")).strip()
+        return texto
+    except Exception as exc:
+        return f"(não consegui rodar {cmd[0]}: {exc})"
+
+
+def rodape_verificacao(diretorio):
+    """Prova independente, no fim do log, de que a delegação tocou o disco.
+
+    O corpo do log acima é o que o EXECUTOR diz de si mesmo, e isso já foi
+    desmentido pelos fatos mais de uma vez: executor anunciando "criado com
+    sucesso" sobre arquivo que não existe (o agy escrevendo no scratch dele), e
+    aviso de sucesso saindo enquanto o entregável nunca deixou o disco. Quem
+    afirma não pode ser a única testemunha.
+
+    Então o DESPACHANTE — não o executor, que não tem como pular nem influenciar
+    isto — carimba no fim do log o estado objetivo do diretório: git status, o
+    último commit e os mtimes. Abrir o log passa a responder "mexeu no disco?"
+    sem ninguém ir conferir à mão.
+
+    Nunca levanta: é evidência, não etapa. Falhar aqui não pode derrubar uma
+    delegação que deu certo.
+    """
+    try:
+        print("", flush=True)
+        print("─" * 62, flush=True)
+        _progresso(f"🔎 VERIFICAÇÃO DO DESPACHANTE (independente do executor)")
+        print(f"diretório: {diretorio}", flush=True)
+
+        dentro = subprocess.run(
+            ["git", "-C", diretorio, "rev-parse", "--is-inside-work-tree"],
+            capture_output=True, text=True, timeout=20,
+            stdin=subprocess.DEVNULL).stdout.strip() == "true"
+
+        if dentro:
+            status = _saida_comando(["git", "-C", diretorio, "status", "--short"])
+            print("\n$ git status --short", flush=True)
+            print(status or "(árvore limpa — nenhum arquivo alterado)", flush=True)
+            print("\n$ git log -1 --oneline", flush=True)
+            print(_saida_comando(["git", "-C", diretorio, "log", "-1", "--oneline"])
+                  or "(sem commit)", flush=True)
+        else:
+            print("\ngit: não é repositório git — sem status/commit para mostrar",
+                  flush=True)
+
+        print("\n$ ls -la --time-style=full-iso (20 primeiras linhas)", flush=True)
+        listagem = _saida_comando(["ls", "-la", "--time-style=full-iso", diretorio])
+        print("\n".join(listagem.splitlines()[:20]), flush=True)
+        print("─" * 62, flush=True)
+    except Exception as exc:
+        try:
+            print(f"(verificação do despachante falhou: {exc})", flush=True)
+        except Exception:
+            pass
+
+
+TETO_DIFF_REVISAO = 14000     # caracteres de mudança que cabem no prompt do revisor
+
+# Extensões que não são leitura para revisor nenhum: binário, cache e artefato
+# de build. Entraram nesta lista pelo caminho difícil — na primeira rodada de
+# teste (28/09/2026) o executor deixou um `__pycache__/` para trás, o revisor
+# recebeu o `.pyc` inteiro dentro do prompt e o `subprocess` morreu com
+# "embedded null byte" ANTES de rever coisa alguma. O IGNORA_SEMPRE já cobria o
+# caminho por mtime; o caminho por git não tinha filtro nenhum.
+BINARIO_NA_REVISAO = {
+    ".pyc", ".pyo", ".so", ".o", ".a", ".dll", ".exe", ".bin", ".dat",
+    ".png", ".jpg", ".jpeg", ".webp", ".gif", ".ico", ".bmp", ".pdf",
+    ".zip", ".gz", ".tar", ".xz", ".7z", ".mp3", ".mp4", ".webm", ".mov",
+    ".woff", ".woff2", ".ttf", ".otf", ".db", ".sqlite", ".lock",
+}
+
+
+ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+# O opencode carimba o modelo usado no fim do stdout ("> build · <modelo>").
+# É contabilidade dele, não parte do veredito — e apareceu colada no texto que
+# iria para o Telegram na primeira rodada de teste, 28/09/2026.
+RODAPE_OPENCODE = re.compile(r"^\s*>\s+\S+\s+·\s+\S+\s*$", re.M)
+
+
+def _limpar_veredito(texto):
+    """Tira do veredito o que é enfeite de terminal, não opinião do revisor."""
+    texto = ANSI.sub("", texto)
+    texto = RODAPE_OPENCODE.sub("", texto)
+    # Linha em branco triplicada vira dupla; o Telegram já é estreito.
+    texto = re.sub(r"\n{3,}", "\n\n", texto)
+    return texto.strip()
+
+
+def _binario_ou_lixo(caminho):
+    """O arquivo é ilegível para um revisor de texto, ou é cache de build?"""
+    p = Path(caminho)
+    if any(parte in IGNORA_SEMPRE for parte in p.parts):
+        return True
+    if p.suffix.lower() in BINARIO_NA_REVISAO:
+        return True
+    return False
+
+
+def _sem_nulos(texto):
+    """Tira byte nulo e caractere de controle que não sobrevive num argv.
+
+    Prompt viaja como argumento de processo, e argumento de processo termina no
+    primeiro `\\x00` — por isso o Python recusa a chamada inteira em vez de
+    truncar. Filtrar a origem (acima) resolve o caso conhecido; isto fecha a
+    classe, para o dia em que o nulo vier de um arquivo de texto de verdade.
+    """
+    return "".join(c for c in texto
+                   if c == "\n" or c == "\t" or (ord(c) >= 32 and c != "\x7f"))
+
+
+def _mudancas_para_revisao(diretorio, desde):
+    """O que mudou no disco, em texto, para o revisor ler. String vazia se nada.
+
+    Preferência pelo `git diff`, que é a descrição exata da mudança. Fora de
+    repositório não há diff nenhum, e aí o que dá para mostrar é a lista do que
+    foi tocado depois de `desde` mais o começo dos arquivos de texto — pior que
+    um diff, melhor que revisar no escuro.
+    """
+    try:
+        dentro = subprocess.run(
+            ["git", "-C", diretorio, "rev-parse", "--is-inside-work-tree"],
+            capture_output=True, text=True, timeout=20,
+            stdin=subprocess.DEVNULL).stdout.strip() == "true"
+    except Exception:
+        dentro = False
+
+    if dentro:
+        partes = []
+        status = _saida_comando(["git", "-C", diretorio, "status", "--short"])
+        if status:
+            partes.append("$ git status --short\n" + status)
+        diff = _saida_comando(["git", "-C", diretorio, "diff", "HEAD"], timeout=40)
+        if not diff.strip():
+            diff = _saida_comando(["git", "-C", diretorio, "diff"], timeout=40)
+        if diff.strip():
+            partes.append("$ git diff HEAD\n" + diff)
+        # Arquivo novo ainda não rastreado não aparece em diff nenhum — e é
+        # exatamente o caso mais comum quando o executor cria um projeto.
+        novos = _saida_comando(
+            ["git", "-C", diretorio, "ls-files", "--others",
+             "--exclude-standard"]).splitlines()
+        for nome in novos:
+            if len([p for p in partes if p.startswith("--- arquivo novo")]) >= 12:
+                break
+            if _binario_ou_lixo(Path(nome)):
+                continue
+            alvo = Path(diretorio) / nome
+            try:
+                if alvo.stat().st_size > 200_000:
+                    partes.append(f"--- {nome} (grande demais para colar aqui) ---")
+                    continue
+                partes.append(f"--- arquivo novo: {nome} ---\n"
+                              + alvo.read_text(errors="replace")[:4000])
+            except Exception:
+                continue
+        texto = "\n\n".join(partes)
+        if texto.strip():
+            return _sem_nulos(texto)[:TETO_DIFF_REVISAO]
+
+    # Sem git: cai para mtime.
+    tocados = []
+    try:
+        base = Path(diretorio)
+        for f in base.rglob("*"):
+            try:
+                if not f.is_file() or f.name.startswith("."):
+                    continue
+                if _binario_ou_lixo(f):
+                    continue
+                st = f.stat()
+                if st.st_mtime < desde or st.st_size == 0:
+                    continue
+                tocados.append((st.st_mtime, f))
+            except OSError:
+                continue
+    except Exception:
+        return ""
+    if not tocados:
+        return ""
+    tocados.sort(reverse=True)
+    partes = ["arquivos tocados por esta tarefa:"]
+    partes += [f"  {f.relative_to(base)}" for _, f in tocados[:25]]
+    for _, f in tocados[:8]:
+        try:
+            if f.stat().st_size > 200_000:
+                continue
+            partes.append(f"\n--- {f.relative_to(base)} ---\n"
+                          + f.read_text(errors="replace")[:3000])
+        except Exception:
+            continue
+    return _sem_nulos("\n".join(partes))[:TETO_DIFF_REVISAO]
+
+
+def revisar_entrega(args, desde):
+    """Um segundo modelo grátis lê o que o primeiro fez e dá um veredito curto.
+
+    Pedido do dono em 28/09/2026, junto com o de mandar tarefa simples para as
+    faixas baratas: "revisar o que fizeram em seguida". O motivo é o histórico
+    desta casa — executor que anuncia sucesso sobre arquivo que não existe, e
+    `ok:true` que já foi tanto falso positivo quanto falso negativo. O
+    `rodape_verificacao` prova que o disco foi tocado; ele não sabe dizer se o
+    que foi escrito faz o que foi pedido. Isto sabe, de forma imperfeita e de
+    graça.
+
+    Três decisões de desenho, cada uma com um porquê:
+
+    - **Revisor cruzado.** MiMo revisa Nex, Nex revisa MiMo (`REVISOR_DE`).
+      Modelo relendo o próprio trabalho tende a confirmá-lo; o valor da revisão
+      está em ser outro leitor.
+    - **O revisor não enxerga o projeto.** Roda com `--dir` num diretório
+      temporário vazio, e recebe o diff dentro do prompt. Revisor com acesso de
+      escrita vira um segundo executor — "corrigindo" o que não entendeu, sem
+      ninguém pedindo, depois do trabalho já estar pronto.
+    - **Nunca bloqueia a entrega.** Relógio curto, e qualquer falha devolve
+      None: a delegação sai com o resultado e sem veredito. Conferência que
+      atrasa ou derruba a entrega é pior que conferência nenhuma.
+    """
+    revisor = REVISOR_DE.get(args.nivel)
+    if not revisor:
+        return None
+    modelo = MODELO_NEX if revisor == "nex" else MODELO_OPENCODE
+    env_rev = {k: v for k, v in os.environ.items() if k != "UNITY_DELEGACAO_ID"}
+    if revisor == "nex":
+        chave = chave_openrouter()
+        if chave:
+            env_rev["OPENROUTER_API_KEY"] = chave
+        else:
+            # Sem a chave da OpenRouter o revisor preferencial não existe. Cair
+            # fora deixaria justamente a faixa mais usada (opencode) sem
+            # revisão nenhuma — que é o estado que este código veio corrigir.
+            # Então revisa com outro modelo do catálogo zen: continua sendo um
+            # segundo leitor, que é o ponto, só não é o melhor deles.
+            revisor, modelo = "zen-reserva", MODELO_REVISOR_RESERVA
+            if modelo == MODELO_OPENCODE:
+                return None    # seria o executor revisando a si mesmo
+
+    mudancas = _mudancas_para_revisao(args.dir, desde)
+    if not mudancas.strip():
+        return (revisor, "PROBLEMAS — o executor não deixou nenhuma mudança no "
+                         "disco. O que ele relatou não tem lastro nos arquivos.")
+
+    prompt = (
+        "You are reviewing work another AI agent just finished. Do NOT write, "
+        "edit or run anything — only read and judge.\n\n"
+        f"=== TASK THE AGENT WAS GIVEN ===\n{args.tarefa}\n\n"
+        f"=== WHAT CHANGED ON DISK ===\n{mudancas}\n\n"
+        "=== WHAT TO CHECK ===\n"
+        "1. Was the task actually done, or only partially done?\n"
+        "2. Obvious bugs, broken syntax, unfinished stubs, TODO left behind.\n"
+        "3. Placeholder or fake content presented as real work.\n"
+        "4. Anything destructive or clearly outside what was asked.\n\n"
+        "=== HOW TO ANSWER ===\n"
+        "Your FIRST line must be exactly one of these three words, alone, "
+        "with nothing after it:\n"
+        "APROVADO\n"
+        "RESSALVAS\n"
+        "PROBLEMAS\n"
+        "Pick APROVADO if the task is done and nothing important is wrong; "
+        "RESSALVAS if it is done but has minor issues; PROBLEMAS if it is not "
+        "done or something serious is wrong.\n"
+        "After that line, write in Portuguese (pt-BR), plain text, at most 4 "
+        "short lines, naming concretely what you found. Do not translate or "
+        "repeat these instructions. No markdown, no headings, no English."
+    )
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="unity-revisao-") as tmp:
+            cmd = [OPENCODE, "run", prompt, "--model", modelo, "--dir", tmp,
+                   "--auto"]
+            _progresso(f"🔍 revisão cruzada: {revisor} lendo o que "
+                       f"{args.nivel} fez ({TIMEOUT_REVISAO}s de teto)")
+            # Trava sempre como "opencode": o revisor roda pelo binário do
+            # opencode qualquer que seja o modelo, e portanto disputa o mesmo
+            # `opencode.db`. Passar o nome do revisor deixaria a reserva
+            # (`zen-reserva`, que não é faixa) fora da fila.
+            with trava_opencode("opencode"):
+                r = subprocess.run(cmd, capture_output=True, text=True,
+                                   cwd=tmp, env=env_rev,
+                                   timeout=TIMEOUT_REVISAO,
+                                   stdin=subprocess.DEVNULL)
+            texto = _limpar_veredito(
+                _texto_puro((r.stdout or "") + "\n" + (r.stderr or "")))
+    except subprocess.TimeoutExpired:
+        _progresso(f"🔍 revisão estourou {TIMEOUT_REVISAO}s — entrega segue sem veredito")
+        return None
+    except Exception as exc:
+        _progresso(f"🔍 revisão falhou ({exc}) — entrega segue sem veredito")
+        return None
+
+    if not texto:
+        return None
+    # O veredito é a parte que interessa; o revisor às vezes fala antes dele.
+    for marca in ("PROBLEMAS", "RESSALVAS", "APROVADO"):
+        pos = texto.find(marca)
+        if pos >= 0:
+            return (revisor, texto[pos:pos + 700].strip())
+    return (revisor, texto[-700:].strip())
+
+
+def executar(args, ident):
+    """Roda o executor até o fim e avisa no Telegram. Chamado no processo filho."""
+    lib = carregar_lib()
+    inicio = time.time()
+
+    # Regra permanente do dono: o trabalho é em inglês, a entrega é em português.
+    # Português custa mais token que inglês para dizer a mesma coisa, e num
+    # pipeline que delega e recebe relatório cada salto paga esse câmbio. O
+    # rodapé é anexado AQUI, e não deixado a cargo de quem chama, porque a
+    # economia só existe se valer em todo delegação — inclusive nos que o
+    # supervisor montar às pressas.
+    RODAPE = (f"\n\nProject directory: {args.dir}\n"
+              f"Use absolute paths.\n"
+              # O agy recusa write_to_file fora do diretorio de artefatos dele
+              # ("is not a valid artifact path"). Pedir para ele escrever no
+              # proprio diretorio evita a morte no ultimo passo; o
+              # unity-delegar copia para o projeto depois.
+              + ("Write output files to your own artifact directory, not into "
+                 "the project directory — the project path will be rejected. "
+                 "Name them clearly; they are copied out afterwards.\n"
+                 if args.nivel == "gemini" else "") +
+              f"Work in English: reasoning, code, comments, commit messages.\n"
+              f"Deliver the FINAL SUMMARY in Portuguese (pt-BR), short — "
+              f"it goes straight to the user on Telegram.")
+
+    # Só a faixa claude/sonnet fala stream-json; agy e opencode não têm o
+    # formato, e para eles o log recebe o stdout cru mesmo.
+    usa_stream = False
+
+    if args.nivel == "gemini":
+        # --add-dir é o que faz o agy enxergar o diretório de verdade; o caminho
+        # absoluto vai TAMBÉM no prompt porque só a flag não basta para ele
+        # entender onde escrever.
+        # --output-format json e o que traz o `usage` (tokens de entrada,
+        # saida, raciocinio) junto da resposta -- sem ele nao ha como saber
+        # quanto uma chamada gastou. O texto final ainda sai limpo porque
+        # extraimos `response` do JSON logo abaixo, antes de qualquer outro
+        # codigo ver `saida`.
+        # O TETO DE ~300s ERA CONFIGURAVEL O TEMPO TODO. Em 21/08/2026 ficou
+        # medido que TODA falha do gemini acontecia em >=300s (304, 304, 306,
+        # 307) e nenhuma abaixo disso — e a conclusao registrada foi "limite do
+        # agy, quebre a tarefa". Estava errada: `agy --print-timeout` tem
+        # PADRAO de 5m0s, e era ele o relogio. Sem passar a flag, o
+        # `--timeout 1800` deste script nunca chegava a valer para o gemini:
+        # o agy se matava aos 300s muito antes.
+        #
+        # Provado por sabotagem em 24/08/2026: com `--print-timeout 20s` numa
+        # tarefa de 45s, o agy devolveu exatamente
+        # `{"status":"ERROR","error":"timeout waiting for response"}` aos ~24s
+        # — o mesmo texto e a mesma sobra de ~4s das falhas reais de 300s. Com
+        # `--print-timeout 10m`, a mesma tarefa terminou em 55s.
+        #
+        # Entao o teto passa a ser o que o chamador pediu. Continua valendo que
+        # tarefa gigante e melhor quebrada — mas agora e escolha, nao parede.
+        cmd = ["agy", "-p", args.tarefa + RODAPE, "--add-dir", args.dir,
+               "--model", MODELO_GEMINI, "--output-format", "json",
+               "--print-timeout", f"{args.timeout}s",
+               "--dangerously-skip-permissions"]
+    elif args.nivel in FAIXAS_GRATIS:
+        # `--auto` é o equivalente do skip-permissions aqui: sem ele o opencode
+        # para esperando aprovação que ninguém vai dar num delegação headless.
+        # `--dir` já faz ele enxergar o projeto (diferente do agy, que precisa do
+        # caminho repetido no prompt).
+        modelo = MODELO_NEX if args.nivel == "nex" else MODELO_OPENCODE
+        cmd = [OPENCODE, "run", args.tarefa + RODAPE, "--model", modelo,
+               "--dir", args.dir, "--auto"]
+    else:
+        # claude = Opus (padrão da conta); sonnet = a faixa do meio.
+        #
+        # `--settings` é o que torna esta faixa autônoma de verdade. Só o
+        # `--permission-mode acceptEdits` aceitava EDIÇÃO e mais nada: Bash
+        # continuava no portão normal e, num `-p`, portão sem ninguém para
+        # responder é recusa. Medido em 02/08: `ls` e `grep` passavam (a
+        # sandbox libera leitura) mas `python3 script.py` voltava com "this
+        # command requires approval", e o executor parou para pedir aprovação
+        # no Telegram no meio da tarefa. As faixas gemini e opencode já eram
+        # autônomas; só esta estava meio aberta.
+        # --chrome habilita as ferramentas de navegador. Preciso para tarefa de
+        # candidatura (formulario de vaga), inofensivo para o resto: a flag so
+        # expoe as ferramentas, quem decide usar e o executor.
+        # --output-format stream-json (+ --verbose, que ele exige junto) é o
+        # que faz o executor falar ENQUANTO trabalha, em vez de só no fim. É a
+        # matéria-prima do log de progresso; ver rodar_com_progresso().
+        cmd = ["claude", "-p", args.tarefa + RODAPE, "--add-dir", args.dir,
+               "--permission-mode", "acceptEdits", "--chrome",
+               "--output-format", "stream-json", "--verbose"]
+        usa_stream = True
+        if DISPATCH_SETTINGS.exists():
+            cmd += ["--settings", str(DISPATCH_SETTINGS)]
+        else:
+            # Sem o arquivo o despacho ainda roda — só volta a travar em Bash.
+            # Falhar aqui deixaria o dono sem executor nenhum, que é pior.
+            print(f"AVISO: {DISPATCH_SETTINGS} ausente — executor sem lista de "
+                  f"permissão, Bash vai pedir aprovação", file=sys.stderr)
+        if args.nivel == "sonnet":
+            cmd += ["--model", "sonnet"]
+
+    # O gemini agora recebe `--print-timeout` igual ao `--timeout`, e leva uns
+    # 4s a mais para desistir e ESCREVER o erro. Sem essa folga os dois relogios
+    # empatam e quem vence e o subprocess.run: o agy morre por SIGKILL antes de
+    # imprimir o JSON, e a delegacao volta como "estourou o tempo limite" sem
+    # o `usage` nem o conversation_id — que e justamente o que permite resgatar
+    # os artefatos dele depois.
+    timeout_externo = args.timeout + 60 if args.nivel == "gemini" else args.timeout
+
+    # O executor NÃO pode herdar UNITY_DELEGACAO_ID. Se herdar — caso de uma
+    # sessão que foi ela própria delegada (ex: um orquestrador do claude_orc
+    # lançado pelo unity-orc) e que agora chama `unity-delegar` para as
+    # subtarefas — a segunda invocação vê a variável, entra em "modo filho"
+    # (main(), logo abaixo), roda TRAVADA em vez de soltar em segundo plano, e
+    # ainda sobrescreve o registro do pai no spool com o id repetido. Medido em
+    # 02/09/2026 na primeira rodada do unity-orc: as tarefas viravam sequenciais
+    # e o orquestrador sumia do `--lista`. Tirar aqui conserta para qualquer
+    # nível — nenhum executor tem uso legítimo para esse id.
+    env_exec = {k: v for k, v in os.environ.items()
+                if k != "UNITY_DELEGACAO_ID"}
+
+    # A faixa `nex` fala com a OpenRouter, que exige credencial. Ela entra no
+    # ambiente do FILHO e em nenhum outro lugar: não é impressa, não vai para o
+    # log, não vai para o spool e não vai para o Telegram.
+    if args.nivel == "nex":
+        _chave = chave_openrouter()
+        if not _chave:
+            env_exec = None    # marca a falta; tratada logo abaixo, antes de rodar
+        else:
+            env_exec["OPENROUTER_API_KEY"] = _chave
+
+    if env_exec is None:
+        saida = ("faixa `nex` sem credencial: a OPENROUTER_API_KEY não está em "
+                 "nenhum dos lugares esperados.\n\n"
+                 f"Para ligar, ponha a chave em UM destes:\n"
+                 f"  1. {CRED_OPENROUTER}  (arquivo com a chave e nada mais)\n"
+                 f"  2. a linha OPENROUTER_API_KEY=... em {ENV_LLM_ROUTER}\n"
+                 f"  3. a variável OPENROUTER_API_KEY no ambiente\n\n"
+                 "A chave é de graça em openrouter.ai/keys. Enquanto isso, "
+                 "use --nivel opencode, que não precisa de nada.")
+        ok = False
+        rodape_verificacao(args.dir)
+        dur = int(time.time() - inicio)
+        registrar({"id": ident, "estado": "terminado", "ok": False,
+                   "nivel": args.nivel, "projeto": args.projeto, "dir": args.dir,
+                   "tarefa": args.tarefa, "terminado_em": time.time(),
+                   "duracao_s": dur, "saida": saida})
+        lib.send_telegram(
+            f"🔒 {args.projeto} — {EXECUTORES['nex']} não rodou\n\n{saida}",
+            silent=False, rodape=True)
+        return
+
+    _progresso(f"▶ {args.nivel} -> {args.projeto} ({args.dir})")
+    try:
+        # A trava do opencode envolve só a corrida do subprocesso: a espera na
+        # fila não consome o `--timeout` da tarefa, que só começa a valer depois.
+        with trava_opencode(args.nivel):
+            saida, ok = rodar_com_progresso(cmd, args.dir, env_exec,
+                                            timeout_externo, usa_stream)
+    except subprocess.TimeoutExpired:
+        saida, ok = f"estourou o tempo limite de {args.timeout}s", False
+    except FileNotFoundError as exc:
+        saida, ok = f"executor não encontrado: {exc}", False
+    except Exception as exc:
+        saida, ok = f"falhou: {exc}", False
+
+    # Sucesso, falha ou estouro de relógio: o carimbo sai igual. Fica logo depois
+    # do executor morrer, antes de qualquer resumo ou envio, para que nem um erro
+    # no caminho do Telegram consiga engolir a evidência.
+    rodape_verificacao(args.dir)
+
+    # agy manda o resultado como JSON quando --nivel gemini (para trazer o
+    # `usage`). Extrai o texto de verdade e loga os tokens ANTES de `saida`
+    # virar o corpo da mensagem -- sem isto o Telegram receberia um blob JSON
+    # cru em vez do resumo. Se nao for JSON valido, mantem `saida` como veio:
+    # texto puro no pior caso e melhor que quebrar a delegacao inteira.
+    conversa_agy = None
+    if args.nivel == "gemini" and saida:
+        try:
+            j = json.loads(saida)
+            # O id da conversa e guardado ANTES de `saida` deixar de ser JSON:
+            # e a unica chave para achar o diretorio de artefatos do agy depois.
+            conversa_agy = j.get("conversation_id")
+            usage = j.get("usage")
+            if usage:
+                registrar_tokens_gemini(ident, args.projeto, usage)
+            resposta = j.get("response")
+            if resposta:
+                saida = resposta.strip()
+        except Exception:
+            pass
+
+    dur = int(time.time() - inicio)
+    # O erro real mora no FIM da saida (é lá que o executor trava/estoura),
+    # não no começo. Guardar os 4000 primeiros caracteres mantinha só a
+    # exploração inicial (ls/git log/grep) e escondia a falha de quem for
+    # investigar depois — foi assim que um "🔴 falhou" de verdade (opencode
+    # completou a tarefa inteira e só falhou no passo final) ficou ilegível
+    # tanto no spool quanto no corpo da mensagem de falha (linha 885, que lê
+    # deste mesmo campo). Medido em 23/09/2026 na delegação c6e7ed13.
+    registrar({"id": ident, "estado": "terminado", "ok": ok, "nivel": args.nivel,
+               "projeto": args.projeto, "dir": args.dir, "tarefa": args.tarefa,
+               "terminado_em": time.time(), "duracao_s": dur,
+               "saida": saida[-4000:]})
+
+    icone = "✅" if ok else "🔴"
+    executor = EXECUTORES.get(args.nivel, args.nivel)
+
+    # FALHA nao passa por LLM. Duas razoes, medidas em 21/08/2026 quando uma
+    # delegacao ao Gemini morreu com erro interno ("another active schedule task
+    # has a conflicting early termination condition") e o dono nunca soube:
+    #   1. resumir_para_telegram() chama o roteador, que pode estar em pico
+    #      (503) ou demorar — e ai o aviso de falha morre junto com a falha.
+    #   2. Resumir mensagem de erro perde justamente o que serve: o texto cru
+    #      do erro. Aqui a saida ja e curta e tecnica, nao precisa de resumo.
+    # O agy pode ter produzido tudo e falhado so na hora de gravar no destino.
+    #
+    # E TAMBEM quando da certo. Ate 24/08/2026 este resgate so funcionava na
+    # FALHA, por acidente: ele redescobria o `conversation_id` reparseando
+    # `saida`, mas no sucesso `saida` ja tinha virado o texto de `response` la
+    # em cima — entao `startswith("{")` dava falso e o resgate voltava vazio,
+    # calado. O RODAPE manda o agy escrever no diretorio dele; sem resgate no
+    # sucesso, o arquivo prometido no resumo nunca chegava ao projeto.
+    # Medido no teste e2e: gemini disse "prova.txt criado", e o projeto ficou
+    # vazio. Anunciar nao e entregar. Agora o id vem de cima, nao do reparse.
+    resgatados = (resgatar_artefatos_agy(conversa_agy, args.dir, inicio)
+                  if args.nivel == "gemini" else [])
+
+    if not ok:
+        cru = _texto_puro(saida).strip()
+        corpo = "Nao terminou. Erro:\n" + (cru[:600] or "sem detalhe")
+        # Diagnostico embutido: bater no relogio nao e a tarefa ser impossivel,
+        # e o tempo pedido ser curto. Sem esta linha o dono tenta de novo igual
+        # e queima os mesmos 300k tokens no mesmo corte.
+        if args.nivel == "gemini" and dur >= args.timeout - 15:
+            corpo += (f"\n\nIsso e o relogio ({args.timeout}s), nao a tarefa. "
+                      f"Redelegar igual falha de novo — de mais tempo com "
+                      f"--timeout, ou quebre em partes menores.")
+        # `deepseek-v4-flash-free` sumiu do catalogo zen em 24/08 e o servidor
+        # responde com erro generico, nao com "modelo nao existe". Sem esta
+        # linha isso parece queda passageira e o dono fica tentando de novo.
+        if args.nivel == "opencode" and "Unexpected server error" in saida:
+            corpo += (f"\n\nEsse erro generico do opencode zen costuma ser "
+                      f"MODELO QUE SAIU DO CATALOGO, nao queda. Rode "
+                      f"`opencode models` e veja se {MODELO_OPENCODE} ainda "
+                      f"esta la; se nao, troque com UNITY_OPENCODE_MODEL.")
+        if resgatados:
+            corpo += (f"\n\nMas o trabalho nao se perdeu: resgatei "
+                      f"{len(resgatados)} arquivo(s) que ele chegou a produzir, "
+                      f"em artefatos-gemini/. Quer que eu aproveite?")
+        else:
+            corpo += "\n\nNada foi aplicado. Me diga se tento de novo."
+    else:
+        corpo = resumir_para_telegram(saida, lib)
+
+    # Revisão cruzada das faixas grátis. Roda DEPOIS do registro no spool e do
+    # rodapé de verificação — o trabalho já está salvo e provado antes de
+    # qualquer opinião sobre ele; se a revisão morrer, nada do que veio antes
+    # se perde. Só no sucesso: entrega que falhou não tem o que revisar.
+    if ok and args.nivel in FAIXAS_GRATIS:
+        quem_veredito = revisar_entrega(args, inicio)
+        if quem_veredito:
+            quem, veredito = quem_veredito
+            corpo += f"\n\n🔍 Revisão ({quem}):\n{veredito}"
+            # O ícone do topo é o que o dono lê de relance. Se o revisor achou
+            # problema, o aviso não pode continuar dizendo ✅ — foi exatamente
+            # assim que "terminou" passou a não significar "ficou bom".
+            if veredito.startswith("PROBLEMAS"):
+                icone = "⚠️"
+
+    # O ARQUIVO vai junto do aviso. Ordem importa: manda o texto primeiro (é o
+    # que explica), depois os anexos — assim, se o upload falhar, ele ao menos
+    # soube que ficou pronto e onde está.
+    anexos = artefatos_novos(args.dir, inicio) if ok else []
+    if anexos:
+        nomes = ", ".join(a.name for a in anexos)
+        corpo = f"{corpo}\n\n📎 Mandando: {nomes}"
+
+    # Omissao NOMEADA. Sem isto, um formato fora da lista branca some calado --
+    # foi assim que o site do Cliente B ficou no disco em 09/09/2026.
+    if ok:
+        sobrou = produzidos_sem_anexo(args.dir, inicio, anexos)
+        if sobrou:
+            corpo += ("\n\n📂 Tambem produziu, mas NAO anexei: "
+                      + ", ".join(str(x) for x in sobrou)
+                      + f"\nEsta em {args.dir}. Se algum ai era a entrega, "
+                        f"me avise -- e sinal de formato que falta na lista.")
+
+    lib.send_telegram(
+        f"{icone} {args.projeto} — {executor} terminou em {dur}s\n\n{corpo}",
+        silent=False, rodape=True)
+
+    for a in anexos:
+        try:
+            if not lib.send_telegram_document(str(a)):
+                lib.send_telegram(
+                    f"⚠️ Nao consegui anexar {a.name}\n"
+                    f"Esta em {a}", silent=False)
+        except Exception as exc:
+            lib.send_telegram(f"⚠️ Falha ao anexar {a.name}: {str(exc)[:80]}\n"
+                              f"Esta em {a}", silent=False)
+    return 0 if ok else 1
+
+
+def main():
+    p = argparse.ArgumentParser(description="Delega tarefa para um executor.")
+    p.add_argument("--nivel",
+                   choices=["claude", "sonnet", "gemini", "opencode", "nex"],
+                   help="executor")
+    p.add_argument("--projeto", help="nome do projeto, para o aviso e o spool")
+    p.add_argument("--dir", help="caminho absoluto do projeto")
+    p.add_argument("--timeout", type=int, default=1800, help="segundos (padrão 1800)")
+    p.add_argument("--lista", action="store_true", help="lista delegações em andamento")
+    p.add_argument("--lista-json", action="store_true",
+                   help="lista delegações em andamento, em JSON (para o unity-heartbeat)")
+    p.add_argument("--forcar-pico", action="store_true",
+                   help="deixa o opencode rodar no pico da DeepSeek mesmo em "
+                        "modelo pago (padrão: rebaixa para gemini)")
+    p.add_argument("tarefa", nargs="?", help="o que fazer")
+    args = p.parse_args()
+
+    if args.lista_json:
+        print(json.dumps(ativos(), ensure_ascii=False))
+        return 0
+
+    if args.lista:
+        return listar()
+
+    if not (args.nivel and args.projeto and args.dir and args.tarefa):
+        p.error("--nivel, --projeto, --dir e a tarefa são obrigatórios")
+
+    if not os.path.isdir(args.dir):
+        print(f"diretório não existe: {args.dir}", file=sys.stderr)
+        return 2
+
+    args.nivel = rebaixar_no_modo_economico(args.nivel)
+    args.nivel = desviar_no_pico(args.nivel, forcar=args.forcar_pico)
+
+    # Modo filho: o pai me relança com esta variável, e aqui eu de fato executo.
+    if os.environ.get("UNITY_DELEGACAO_ID"):
+        return executar(args, os.environ["UNITY_DELEGACAO_ID"])
+
+    # Recusa duas delegações no mesmo diretório — corromper repositório é o único
+    # dano que a concorrência causa aqui.
+    for i, r in ativos().items():
+        if os.path.realpath(r["dir"]) == os.path.realpath(args.dir):
+            print(f"já existe delegação rodando neste diretório: {i} "
+                  f"({r['tarefa'][:60]}). Espere ou use outro projeto.",
+                  file=sys.stderr)
+            return 3
+
+    ident = uuid.uuid4().hex[:8]
+
+    # setsid + saída redirecionada: o filho sobrevive ao fim do turno do
+    # supervisor. Sem isso, a delegação morreria junto com o Bash que o criou.
+    #
+    # Atenção ao limite disto: setsid tira o filho do grupo de processos, NÃO do
+    # cgroup do systemd. `systemctl stop` no serviço que despachou continua
+    # levando a delegação junto (KillMode=control-group é o padrão). É
+    # justamente por isso que o registro precisa carregar prova de vida — ver
+    # `ativos()`.
+    log = SPOOL / f"{ident}.log"
+    env = dict(os.environ, UNITY_DELEGACAO_ID=ident)
+    with open(log, "w") as fh:
+        filho = subprocess.Popen(
+            [sys.executable, __file__, "--nivel", args.nivel,
+             "--projeto", args.projeto, "--dir", args.dir,
+             "--timeout", str(args.timeout)]
+            # O filho reavalia as travas; sem repassar a flag, um despacho
+            # forçado no pico seria desviado na segunda passagem.
+            + (["--forcar-pico"] if args.forcar_pico else [])
+            + [args.tarefa],
+            env=env, stdout=fh, stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL, start_new_session=True, cwd=args.dir)
+
+    # O registro vai DEPOIS do Popen, de propósito: é ele que traz o `pid`, e
+    # uma linha "rodando" sem pid é exatamente a que não dá para desmentir
+    # depois. Se o Popen falhar, nada foi registrado e nada fica trancado.
+    registrar({"id": ident, "estado": "rodando", "nivel": args.nivel,
+               "projeto": args.projeto, "dir": args.dir, "tarefa": args.tarefa,
+               "iniciado_em": time.time(), "pid": filho.pid,
+               "timeout": args.timeout})
+
+    print(f"delegado {ident} ({args.nivel} -> {args.projeto}). "
+          f"O resultado chega no Telegram. Log: {log}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

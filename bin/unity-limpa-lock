@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Remove ~/.claude/daemon.lock quando ele esta obsoleto.
+#
+# Por que existe: o lock guarda o pid do supervisor. Depois de um reboot o
+# kernel recicla os pids baixos, entao o pid gravado passa a apontar para
+# outro processo (em 28/08/2026 apontava para o dockerd, pid 361). O daemon
+# entao acha que "outro daemon ganhou a corrida do lock" e sai com codigo 1 —
+# em laco, 1003 vezes, sem nada no journal. A Unity nunca subia.
+#
+# Roda como ExecStartPre do unity-daemon.service. Nunca apaga um lock vivo:
+# so remove quando consegue provar que o dono morreu.
+set -uo pipefail
+
+LOCK="${HOME}/.claude/daemon.lock"
+STATUS="${HOME}/.claude/daemon.status.json"
+
+[[ -f "$LOCK" ]] || exit 0
+
+pid=$(sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9]\+\).*/\1/p' "$LOCK" | head -1)
+started=$(sed -n 's/.*"startedAt"[[:space:]]*:[[:space:]]*\([0-9]\+\).*/\1/p' "$LOCK" | head -1)
+procstart=$(sed -n 's/.*"procStart"[[:space:]]*:[[:space:]]*"\?\([0-9]\+\)"\?.*/\1/p' "$LOCK" | head -1)
+
+# Sem pid legivel o lock nao serve para nada.
+if [[ -z "${pid:-}" ]]; then
+  motivo="lock ilegivel (sem pid)"
+else
+  btime=$(awk '/^btime/{print $2}' /proc/stat)
+
+  if [[ -n "${started:-}" ]] && (( started / 1000 < btime )); then
+    # Escrito antes do boot atual: o dono nao pode ter sobrevivido.
+    motivo="lock anterior ao boot (pid=$pid)"
+  elif [[ ! -d "/proc/$pid" ]]; then
+    motivo="dono morto (pid=$pid)"
+  elif [[ -n "${procstart:-}" ]] && \
+       [[ "$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null)" != "$procstart" ]]; then
+    # Pid existe mas nasceu noutra hora: foi reciclado para outro processo.
+    motivo="pid reciclado (pid=$pid, agora $(cat "/proc/$pid/comm" 2>/dev/null))"
+  else
+    exit 0   # lock vivo e legitimo — nao encostar
+  fi
+fi
+
+# Guarda uma copia antes de remover; nunca apagar sem backup.
+bak="${HOME}/.claude/daemon.lock.stale-$(date +%Y%m%d-%H%M%S)"
+cp -p "$LOCK" "$bak" 2>/dev/null
+rm -f "$LOCK" "$STATUS"
+echo "unity-limpa-lock: removido lock obsoleto — ${motivo}; copia em ${bak}"
+
+# Mantem no maximo 5 copias.
+ls -1dt "${HOME}"/.claude/daemon.lock.stale-* 2>/dev/null | tail -n +6 | xargs -r rm -f
+exit 0

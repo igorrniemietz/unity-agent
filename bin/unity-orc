@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# unity-orc — dispara uma rodada do claude_orc em segundo plano, sem terminal.
+#
+# Por que existe: a Unity é porteira do canal do Telegram e não pode ficar presa
+# 60 min rodando uma orquestração — enquanto isso o dono manda mensagem e não
+# recebe nada. Mas o claude_orc PRECISA de uma sessão Claude viva: ele planeja o
+# grafo de tarefas, verifica cada entrega e faz o merge; só o Gemini/DeepSeek é
+# que escrevem código. Este script junta as duas coisas — lança essa sessão
+# orquestradora via `unity-delegar --nivel sonnet`, em segundo plano, já
+# apontada para a skill, e volta na hora com um id.
+#
+# O executor (Sonnet) consome cota da Anthropic enquanto a rodada dura. Os
+# trabalhadores (Gemini) são grátis. Esse é o mesmo trato do claude_orc rodado
+# na mão — a diferença aqui é só o gatilho: dá pra disparar do celular.
+#
+# Uso:
+#   unity-orc --projeto <nome> --dir <caminho-abs> [--brief BRIEF.md]
+#             [--timeout 5400] ["objetivo da rodada, texto livre"]
+#
+#   --projeto   nome curto, vai pro aviso e pro spool do unity-delegar
+#   --dir       caminho absoluto do projeto (é inicializado como repo git se
+#               ainda não for — o claude_orc precisa de git pra paralelizar)
+#   --brief     arquivo de spec na raiz do projeto pra sessão ler primeiro
+#   --timeout   teto em segundos da sessão orquestradora (padrão 5400 = 90 min,
+#               cobre o orçamento de 60 min da rodada + planejamento + merge)
+#   objetivo    opcional; recorta a rodada ("só a fase 1", "só o parser")
+#
+#   unity-orc --lista     atalho para `unity-delegar --lista`
+set -euo pipefail
+
+if [ "${1:-}" = "--lista" ]; then exec unity-delegar --lista; fi
+
+projeto=""; dir=""; brief=""; timeout=5400; objetivo=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --projeto) projeto="${2:-}"; shift 2;;
+    --dir)     dir="${2:-}"; shift 2;;
+    --brief)   brief="${2:-}"; shift 2;;
+    --timeout) timeout="${2:-}"; shift 2;;
+    -h|--help) sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^#\( \|$\)//'; exit 0;;
+    --*) echo "unity-orc: opção desconhecida: $1" >&2; exit 2;;
+    *) objetivo="$1"; shift;;
+  esac
+done
+
+[ -n "$projeto" ] && [ -n "$dir" ] || {
+  echo "unity-orc: --projeto e --dir são obrigatórios (veja --help)" >&2; exit 2; }
+[ -d "$dir" ] || { echo "unity-orc: diretório não existe: $dir" >&2; exit 2; }
+dir="$(cd "$dir" && pwd)"
+
+if [ -n "$brief" ] && [ ! -f "$dir/$brief" ]; then
+  echo "unity-orc: brief não encontrado em $dir/$brief" >&2; exit 2
+fi
+
+# Já há uma delegação viva apontando pra esta pasta? O claude_orc recusaria a
+# segunda de qualquer jeito (unity-delegar barra duas no mesmo diretório real);
+# barrar aqui dá uma mensagem melhor.
+if unity-delegar --lista 2>/dev/null | grep -Fq "$dir"; then
+  echo "unity-orc: já existe delegação viva em $dir — espere ela terminar" >&2
+  unity-delegar --lista 2>/dev/null | grep -F "$dir" >&2 || true
+  exit 3
+fi
+
+# claude_orc paraleliza criando um worktree git por tarefa. Sem git ele ainda
+# roda, mas sequencial. Inicializa se preciso, com um commit-base pra ter de
+# onde ramificar.
+if ! git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "[unity-orc] $dir não é repo git — inicializando (claude_orc precisa pra paralelizar)"
+  git -C "$dir" init -q
+  printf '%s\n' 'data/' '*.pdf' '*.xlsx' '*.xls' '*.csv' '*.ofx' '*.jpeg' '*.jpg' \
+    '*.png' '*.db' '*.sqlite' '*.sqlite3' '.env' '__pycache__/' '.venv/' 'node_modules/' \
+    >> "$dir/.gitignore"
+  git -C "$dir" add -A
+  git -C "$dir" -c user.email='orc@local' -c user.name='unity-orc' \
+    commit -qm 'estado inicial antes do claude_orc' || true
+fi
+
+briefline=""
+[ -n "$brief" ] && briefline="Read $brief first — it is the full spec for this project. "
+
+# A sessão orquestradora roda com --dir apontando pra pasta principal, então ela
+# própria ocupa o "lock" de delegação nessa pasta no spool do unity-delegar.
+# Consequência: ela NÃO consegue delegar uma tarefa de volta pra pasta principal
+# (unity-delegar recusaria) — por isso a instrução de sempre usar worktree, até
+# pra tarefa única.
+prompt="Invoke the claude_orc skill and run one full orchestration round for this project.
+${briefline}${objetivo:+Round objective (scope the round to this): $objetivo. }
+Rules for THIS run, on top of the skill:
+- Delegate every coding task to Gemini (--nivel gemini). The owner wants ZERO
+  extra cost. Use DeepSeek (--nivel opencode) only off-peak AND only as the
+  cross-executor fallback when a Gemini task fails the verification gate.
+- This orchestrator session already holds the unity-delegar lock on the main
+  project directory, so you CANNOT delegate a task with --dir set to the main
+  directory — it will be refused. Create a git worktree for EVERY coding task,
+  even a lone one, and point --dir at the worktree. Merge sequentially into the
+  main directory yourself after each task passes the gate.
+- Respect the skill budget: 3 tries per task, 12 delegations per round, 60 min
+  round clock, stop after 2 waves that close zero tasks.
+- ok:true is not delivery — run the verification gate before marking any [x].
+- Keep ROADMAP.md on disk updated after every wave.
+When the whole scope is done (or the budget stops the round), send the Telegram
+completion message exactly as the skill's section 6 defines it."
+
+echo "[unity-orc] lançando orquestrador — sonnet, segundo plano, timeout ${timeout}s"
+exec unity-delegar --nivel sonnet --projeto "$projeto" --dir "$dir" \
+  --timeout "$timeout" "$prompt"

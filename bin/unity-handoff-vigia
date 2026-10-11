@@ -1,0 +1,378 @@
+#!/usr/bin/env python3
+"""Vigia de ociosidade: 1h30 parada = handoff gravado no ai-memory e conferido.
+
+Por que existe: o ai-memory já grava um handoff sozinho no FIM da sessão, mas
+sessão de fundo não termina — ela é ceifada ~60 min depois de virar ociosa (ver
+a memória project_unity_morte_silenciosa_60min). O handoff automático que sobra
+dali é pobre ("Started: ...", "Tools used: tool file"). Este vigia fecha o
+buraco: dispara pelo relógio de ociosidade, monta o resumo lendo o transcript em
+disco, e só se dá por satisfeito depois de LER a linha de volta no banco.
+
+Escopo: só sessões de fundo e delegações. Sessão interativa do dono fica de
+fora, por decisão dele em 19/08/2026.
+
+Roda por timer a cada 10 min. Idempotente: o estado em disco impede handoff
+repetido do mesmo episódio de ociosidade.
+"""
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+OCIOSO_LIMITE = int(os.environ.get("UNITY_OCIOSO_LIMITE", 5400))   # 1h30
+ESTADO = Path.home() / ".local/share/unity-supervisor/vigia-sessoes.json"
+LOG = Path.home() / ".local/share/unity-supervisor/vigia.log"
+LIB = "/home/reaper/.local/bin/unity-lib.py"
+MCP = "http://127.0.0.1:49374/mcp"
+DB = "/var/lib/docker/volumes/ai-memory-data/_data/db/memory.sqlite"
+TOKEN_ENV = Path.home() / "infra/ai-memory/.env"
+
+# Transcript velho demais não é sessão parada, é sessão morta e enterrada — o
+# handoff dela só poluiria a fila de quem abrir o projeto amanhã.
+IDADE_MAXIMA = int(os.environ.get("UNITY_VIGIA_IDADE_MAXIMA", 86400))   # 24 h
+
+
+def log(msg):
+    try:
+        LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(LOG, "a") as fh:
+            fh.write(f"[{time.strftime('%Y-%m-%dT%H:%M:%S')}] {msg}\n")
+    except Exception:
+        pass
+
+
+def carregar_lib():
+    spec = importlib.util.spec_from_file_location("unity_lib", LIB)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+def token():
+    try:
+        for linha in TOKEN_ENV.read_text().splitlines():
+            if linha.startswith("AI_MEMORY_AUTH_TOKEN="):
+                return linha.split("=", 1)[1].strip().strip('"')
+    except Exception:
+        pass
+    return os.environ.get("AI_MEMORY_AUTH_TOKEN", "")
+
+
+# ─── estado ────────────────────────────────────────────────────────────────
+def ler_estado():
+    try:
+        return json.loads(ESTADO.read_text())
+    except Exception:
+        return {}
+
+
+def gravar_estado(d):
+    ESTADO.parent.mkdir(parents=True, exist_ok=True)
+    tmp = ESTADO.with_suffix(".tmp")
+    tmp.write_text(json.dumps(d, ensure_ascii=False, indent=1))
+    tmp.replace(ESTADO)      # troca atômica: timer concorrente não lê meio arquivo
+
+
+# ─── descoberta ────────────────────────────────────────────────────────────
+def registrar_vivas(estado):
+    """Anota no registro toda sessão de fundo que estiver viva AGORA.
+
+    O registro precisa sobreviver à morte da sessão: aos 90 min de ociosidade o
+    processo já foi ceifado há meia hora e `claude agents --json` não a lista
+    mais. Sem esta anotação, a sessão que mais precisa de handoff é justamente a
+    que o vigia nunca veria.
+    """
+    try:
+        saida = subprocess.run(
+            ["unity-sessoes", "--json"],
+            capture_output=True, text=True, timeout=40,
+        ).stdout
+        d = json.loads(saida)
+    except Exception as e:
+        log(f"unity-sessoes falhou: {e}")
+        return
+
+    for s in d.get("sessoes", []):
+        if s.get("kind") == "interactive":
+            continue                      # decisão do dono: fora do escopo
+        sid = s.get("sessionId")
+        if not sid or not s.get("transcript"):
+            continue
+        reg = estado.setdefault(sid, {})
+        reg.update({
+            "cwd": s.get("cwd"),
+            "transcript": s.get("transcript"),
+            "nome": s.get("nome"),
+            "unity": s.get("unity"),
+            "visto_em": int(time.time()),
+        })
+
+
+# ─── resumo determinístico ─────────────────────────────────────────────────
+CANAL = re.compile(r"<channel\b[^>]*>(.*?)</channel>", re.S)
+
+
+def texto_do_usuario(conteudo):
+    if isinstance(conteudo, str):
+        t = conteudo
+    elif isinstance(conteudo, list):
+        partes = [b.get("text", "") for b in conteudo
+                  if isinstance(b, dict) and b.get("type") == "text"]
+        t = "\n".join(partes)
+    else:
+        return ""
+    # O Telegram chega embrulhado em <channel>; o que interessa é o miolo.
+    m = CANAL.search(t)
+    if m:
+        t = m.group(1)
+    return t.strip()
+
+
+def ler_transcript(caminho):
+    """Sem LLM, de propósito.
+
+    Resumo por LLM aqui seria gasto no roteador, e no horário de pico da
+    DeepSeek o vigia simplesmente não teria como rodar (ver o 503 do
+    llm-router). Regex e leitura de campo funcionam às 4 da manhã e de graça.
+    """
+    prompts, arquivos, ultima_fala = [], [], ""
+    try:
+        linhas = Path(caminho).read_text(errors="replace").splitlines()
+    except Exception:
+        return prompts, arquivos, ultima_fala
+
+    for linha in linhas:
+        try:
+            d = json.loads(linha)
+        except Exception:
+            continue
+        tipo = d.get("type")
+        msg = d.get("message") or {}
+        if tipo == "user" and not d.get("isMeta"):
+            t = texto_do_usuario(msg.get("content"))
+            # tool_result volta como user; corta o que não é fala de gente.
+            if t and not t.startswith(("[", "<tool")) and len(t) > 2:
+                prompts.append(t)
+        elif tipo == "assistant":
+            for b in (msg.get("content") or []):
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "text" and b.get("text", "").strip():
+                    ultima_fala = b["text"].strip()
+                elif b.get("type") == "tool_use":
+                    fp = (b.get("input") or {}).get("file_path")
+                    if fp and fp not in arquivos:
+                        arquivos.append(fp)
+    return prompts, arquivos, ultima_fala
+
+
+def montar_handoff(caminho, cwd, ocioso):
+    prompts, arquivos, ultima_fala = ler_transcript(caminho)
+    pedido = prompts[-1] if prompts else ""
+    primeiro = prompts[0] if prompts else ""
+
+    horas = ocioso // 3600
+    minutos = (ocioso % 3600) // 60
+    resumo = (
+        f"Sessao de fundo em {cwd} ficou {horas}h{minutos:02d} sem interacao e "
+        f"foi encerrada pelo vigia da Unity. "
+        f"Ultimo pedido do dono: \"{pedido[:280]}\". "
+        f"Ultima resposta da sessao: \"{ultima_fala[:280]}\"."
+    )
+    if primeiro and primeiro != pedido:
+        resumo += f" A sessao comecou com: \"{primeiro[:160]}\"."
+
+    perguntas = [
+        "A sessao parou no meio? Confira se o ultimo pedido foi concluido "
+        "antes de comecar coisa nova.",
+    ]
+    if len(prompts) > 1:
+        perguntas.append(
+            f"Foram {len(prompts)} pedidos nesta sessao; o transcript completo "
+            f"esta em {caminho}."
+        )
+
+    proximos = []
+    if pedido:
+        proximos.append(f"Retomar de: {pedido[:200]}")
+    proximos.append(f"Transcript integral: {caminho}")
+
+    return {
+        "summary": resumo,
+        "open_questions": perguntas,
+        "next_steps": proximos,
+        "files_touched": arquivos[:40],
+        "cwd": cwd,
+        "project": Path(cwd).name or "reaper",
+    }
+
+
+# ─── gravação e conferência ────────────────────────────────────────────────
+def gravar_handoff(args):
+    import urllib.request
+    corpo = json.dumps({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "memory_handoff_begin", "arguments": args},
+    }).encode()
+    req = urllib.request.Request(
+        MCP, data=corpo, method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+            "Authorization": f"Bearer {token()}",
+        })
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.loads(r.read())
+
+
+def conferir(cwd, desde_us):
+    """A conferência é o ponto do pedido — 'valida que foi feito'.
+
+    Confiar no 200 da chamada seria repetir o erro do `ok: true` da delegação,
+    que já mentiu antes (memoria feedback_delegacao_ok_nao_significa_commitado).
+    Aqui a prova é a linha lida de volta no SQLite do ai-memory, por um caminho
+    diferente do que escreveu.
+    """
+    codigo = (
+        "import sqlite3,json,sys\n"
+        f"c=sqlite3.connect('file:{DB}?mode=ro',uri=True)\n"
+        "r=c.execute(\"select summary,state,created_at from handoffs \"\n"
+        "  \"where cwd=? and created_at>=? order by created_at desc limit 1\",\n"
+        f"  (sys.argv[1], {desde_us})).fetchone()\n"
+        "print(json.dumps({'achou': r is not None,\n"
+        "  'state': r[1] if r else None,\n"
+        "  'summary': (r[0][:120] if r else None)}))\n"
+    )
+    try:
+        out = subprocess.run(
+            ["sudo", "-n", "python3", "-c", codigo, cwd],
+            capture_output=True, text=True, timeout=30,
+        )
+        return json.loads(out.stdout.strip() or "{}")
+    except Exception as e:
+        return {"achou": None, "erro": str(e)}
+
+
+# ─── laço ──────────────────────────────────────────────────────────────────
+def forcar(caminho, cwd):
+    """Grava handoff AGORA, sem esperar as 1h30 de ociosidade.
+
+    Chamado pelo `unity-ensure` no instante em que ele decide DESCARTAR um
+    transcript grande demais para retomar. Esse é exatamente o momento em que a
+    continuidade se perderia: a sessão nova nasce com contexto zero, e sem isto
+    o ai-memory não tem o que entregar no SessionStart — medido em 20/08/2026,
+    o hook devolvia `{}` para o cwd dela.
+    """
+    caminho = str(caminho)
+    if not Path(caminho).is_file():
+        return 1
+    try:
+        mtime = Path(caminho).stat().st_mtime
+        ocioso = max(int(time.time() - mtime), 0)
+        args = montar_handoff(caminho, cwd, ocioso)
+        args["summary"] = ("Sessao anterior encerrada e transcript descartado por "
+                           "tamanho (a retomada custaria reenviar tudo). " +
+                           args["summary"])
+        desde_us = int(time.time() * 1_000_000) - 5_000_000
+        resp = gravar_handoff(args)
+        if resp.get("error"):
+            log(f"forcar FALHOU {caminho}: {resp['error']}")
+            return 1
+        prova = conferir(cwd, desde_us)
+        if prova.get("achou"):
+            log(f"handoff forcado OK cwd={cwd} de {Path(caminho).name}")
+            return 0
+        log(f"forcar sem confirmacao no banco: {prova}")
+        return 1
+    except Exception as exc:
+        log(f"forcar exceção: {exc}")
+        return 1
+
+
+def main():
+    if "--forcar" in sys.argv:
+        i = sys.argv.index("--forcar")
+        caminho = sys.argv[i + 1]
+        cwd = sys.argv[i + 2] if len(sys.argv) > i + 2 else str(Path.home())
+        raise SystemExit(forcar(caminho, cwd))
+
+    lib = carregar_lib()
+    estado = ler_estado()
+    registrar_vivas(estado)
+    agora = time.time()
+    feitos, falhas = [], []
+
+    for sid, reg in list(estado.items()):
+        caminho = reg.get("transcript")
+        cwd = reg.get("cwd")
+        if not caminho or not cwd or not Path(caminho).is_file():
+            continue
+
+        mtime = Path(caminho).stat().st_mtime
+        ocioso = int(agora - mtime)
+
+        # Voltou a trabalhar depois do handoff: rearma para o próximo episódio.
+        if reg.get("handoff_mtime") and mtime > reg["handoff_mtime"] + 1:
+            reg.pop("handoff_mtime", None)
+            reg.pop("handoff_em", None)
+
+        if ocioso < OCIOSO_LIMITE:
+            continue
+        if ocioso > IDADE_MAXIMA:
+            continue
+        if reg.get("handoff_em"):
+            continue
+
+        args = montar_handoff(caminho, cwd, ocioso)
+        desde_us = int(time.time() * 1_000_000) - 5_000_000   # 5 s de folga
+        try:
+            resp = gravar_handoff(args)
+            erro = resp.get("error")
+        except Exception as e:
+            resp, erro = None, {"message": str(e)}
+
+        prova = conferir(cwd, desde_us) if not erro else {"achou": False}
+
+        if not erro and prova.get("achou"):
+            reg["handoff_em"] = int(agora)
+            reg["handoff_mtime"] = mtime
+            reg["handoff_prova"] = prova.get("state")
+            feitos.append((reg.get("nome") or Path(cwd).name, ocioso))
+            log(f"handoff OK {sid} cwd={cwd} ocioso={ocioso}s state={prova.get('state')}")
+        else:
+            reg["handoff_falha"] = {
+                "quando": int(agora),
+                "erro": (erro or {}).get("message") if erro else "nao encontrado no banco",
+                "prova": prova,
+            }
+            falhas.append((reg.get("nome") or Path(cwd).name,
+                           reg["handoff_falha"]["erro"]))
+            log(f"handoff FALHOU {sid} cwd={cwd}: {reg['handoff_falha']['erro']}")
+
+    gravar_estado(estado)
+
+    # Só fala no Telegram quando houve o quê contar. Vigia que dá bom-dia a cada
+    # 10 min vira ruído e o dono para de ler.
+    if feitos:
+        linhas = ["💾 Handoff por inatividade"]
+        for nome, ocioso in feitos:
+            linhas.append(f"· {nome} — {ocioso // 3600}h{(ocioso % 3600) // 60:02d} parada")
+        linhas.append("")
+        linhas.append("Gravado e conferido no banco.")
+        lib.send_telegram("\n".join(linhas))
+    if falhas:
+        linhas = ["⚠️ Handoff NAO confirmado"]
+        for nome, err in falhas:
+            linhas.append(f"· {nome}: {str(err)[:60]}")
+        lib.send_telegram("\n".join(linhas))
+
+    if "--verboso" in sys.argv:
+        print(json.dumps({"feitos": feitos, "falhas": falhas,
+                          "registro": len(estado)}, ensure_ascii=False, indent=1))
+
+
+main()

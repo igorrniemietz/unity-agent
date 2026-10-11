@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""O que está EM ABERTO agora: sessões paradas, despachos sem retorno, memória
+"""O que está EM ABERTO agora: sessões paradas, delegações sem retorno, memória
 esperando aprovação.
 
-Existe por uma pergunta do Igor que o resto do ferramental não respondia:
+Existe por uma pergunta do dono que o resto do ferramental não respondia:
 "quantos assuntos eu tenho em aberto, e quais sessões estão paradas há mais de
 uma hora sem ninguém interagir — dá para encerrar sem deixar coisa pela
-metade?". O `unity-uso` mostra CONSUMO, o `unity-despachar --lista` mostra só
-despacho. Nenhum dos dois responde "o que ficou aberto".
+metade?". O `unity-uso` mostra CONSUMO, o `unity-delegar --lista` mostra só
+delegação. Nenhum dos dois responde "o que ficou aberto".
 
 Três fontes, porque três coisas ficam abertas de jeitos diferentes:
 
@@ -15,7 +15,7 @@ Três fontes, porque três coisas ficam abertas de jeitos diferentes:
    O tempo parado vem do mtime do transcript, que é o último sinal REAL de
    interação; `updatedAt` do state.json mexe sozinho e mentiria para menos.
 
-2. DESPACHO SEM RETORNO — o `unity-despachar` grava "rodando" e só grava
+2. DELEGACAO SEM RETORNO — o `unity-delegar` grava "rodando" e só grava
    "terminado" no fim. Se o processo filho morrer (máquina reiniciada, kill),
    o registro fica "rodando" para sempre. Esses são os que somem sem avisar.
 
@@ -45,7 +45,7 @@ from pathlib import Path
 
 JOBS = Path.home() / ".claude/jobs"
 TRANSCRIPTS = Path.home() / ".claude/projects/-home-reaper"
-DESPACHOS = Path.home() / ".local/share/unity-orquestrador/despachos.jsonl"
+DELEGACOES = Path.home() / ".local/share/unity-orquestrador/delegacoes.jsonl"
 SETTINGS = Path.home() / ".claude/settings.json"
 AI_MEMORY = Path.home() / ".local/bin/ai-memory"
 DATA_DIR = Path.home() / ".local/share/ai-memory"
@@ -126,25 +126,95 @@ def sessoes(limite):
     return canal, sorted(paradas, key=lambda x: -x[1])
 
 
-# --------------------------------------------------------------- despachos
+# --------------------------------------------------------------- delegações
 
-def despachos_abertos():
-    """Despachos que começaram e nunca gravaram o fim."""
-    if not DESPACHOS.exists():
+def morreu(r):
+    """A delegação morreu sem gravar o fim? Responde com certeza quando dá.
+
+    Antes este relatório só sabia dizer "sem retorno" e mandava o dono adivinhar
+    ("se passou muito do tempo limite, o processo morreu"). Agora o registro
+    carrega o `pid` do filho, então dá para perguntar ao sistema em vez de
+    chutar. Sinal 0 não mata, só pergunta se o processo existe.
+
+    Entradas antigas não têm `pid`; para elas sobra o relógio, com a mesma
+    folga que o `unity-delegar` usa. Na dúvida devolve False — dizer "morreu"
+    sobre algo que ainda está rodando seria pior que a dúvida.
+    """
+    pid = r.get("pid")
+    if pid:
+        try:
+            os.kill(int(pid), 0)
+            return False
+        except ProcessLookupError:
+            return True
+        except Exception:
+            return False
+    limite = (r.get("timeout") or 1800) + 120
+    return (time.time() - r.get("iniciado_em", 0)) > limite
+
+
+def _fechar_mortas(estado):
+    """Grava o fim das delegações cujo processo morreu sem registrá-lo.
+
+    Sem isto, uma delegação que o filho não conseguiu encerrar (reboot, OOM,
+    kill) fica "rodando" para sempre e reaparece neste relatório a cada rodada
+    do timer — foi a reclamação do dono em 01/09/2026, com 10 fantasmas de até
+    25 dias. O `unity-delegar --lista` já as ignora pela prova de PID; aqui a
+    gente também escreve a linha de fechamento, para o spool refletir a
+    realidade e o relatório se limpar sozinho na próxima execução.
+
+    Só toca em entrada com veredito de morte CERTO (PID inexistente ou relógio
+    muito além do timeout). Nunca fecha algo que ainda pode estar rodando.
+    """
+    mortas = [r for r in estado.values()
+              if r.get("estado") == "rodando" and morreu(r)]
+    if not mortas:
+        return
+    try:
+        with DELEGACOES.open("a") as f:
+            for r in mortas:
+                linha = json.dumps({
+                    "id": r["id"],
+                    "estado": "abortado",
+                    "ok": False,
+                    "nivel": r.get("nivel", "?"),
+                    "projeto": r.get("projeto", "?"),
+                    "tarefa": r.get("tarefa", ""),
+                    "motivo": "processo morreu sem gravar o fim",
+                    "iniciado_em": r.get("iniciado_em", 0),
+                    "fechado_em": time.time(),
+                    "fechado_por": "unity-pendencias",
+                }, ensure_ascii=False)
+                f.write(linha + "\n")
+                estado[r["id"]] = json.loads(linha)
+    except Exception:
+        pass
+
+
+def delegacoes_abertas():
+    """Delegações que começaram e nunca gravaram o fim — só as que ainda vivem.
+
+    As que morreram sem registrar o fim são fechadas aqui (`_fechar_mortas`) e
+    somem do relatório; não faz sentido cobrar do dono uma decisão sobre um
+    processo que não existe mais.
+    """
+    if not DELEGACOES.exists():
         return []
     estado = {}
-    for linha in DESPACHOS.read_text().splitlines():
+    for linha in DELEGACOES.read_text().splitlines():
         try:
             r = json.loads(linha)
         except Exception:
             continue
         estado[r["id"]] = r
+    _fechar_mortas(estado)
     abertos = []
     for i, r in estado.items():
         if r.get("estado") != "rodando":
             continue
         abertos.append((i, horas(r["iniciado_em"]), r.get("nivel", "?"),
-                        r.get("projeto", "?"), r.get("tarefa", "")[:60]))
+                        r.get("projeto", "?"), r.get("tarefa", "")[:60],
+                        False))
     return sorted(abertos, key=lambda x: -x[1])
 
 
@@ -168,7 +238,10 @@ def memorias_pendentes():
         p = subprocess.run(
             [str(AI_MEMORY), "--data-dir", str(DATA_DIR), "pending-writes", "list"],
             capture_output=True, text=True, timeout=40, env=env)
-        return [l.split()[-1] for l in p.stdout.splitlines() if " pending " in l]
+        # "(no pending writes)" também casa com " pending " e virava
+        # uma pendência fantasma. Descarta a linha de lista vazia.
+        return [l.split()[-1] for l in p.stdout.splitlines()
+                if " pending " in l and "no pending writes" not in l]
     except Exception:
         return []
 
@@ -185,7 +258,7 @@ def main():
     a = ap.parse_args()
 
     canal, paradas = sessoes(a.horas)
-    desp = despachos_abertos()
+    desp = delegacoes_abertas()
     mem = memorias_pendentes()
     total = len(paradas) + len(desp) + len(mem)
 
@@ -200,8 +273,8 @@ def main():
         if paradas:
             p.append(plural(len(paradas), "sessão parada", "sessões paradas"))
         if desp:
-            p.append(plural(len(desp), "despacho sem retorno",
-                            "despachos sem retorno"))
+            p.append(plural(len(desp), "delegação sem retorno",
+                            "delegações sem retorno"))
         if mem:
             p.append(plural(len(mem), "memória pendente", "memórias pendentes"))
         print("📌 " + " · ".join(p))
@@ -229,14 +302,16 @@ def main():
         print()
 
     if desp:
-        print("⏳ " + plural(len(desp), "despacho sem retorno",
-                            "despachos sem retorno"))
-        for i, h, nivel, projeto, tarefa in desp:
+        print("⏳ " + plural(len(desp), "delegação sem retorno",
+                            "delegações sem retorno"))
+        for i, h, nivel, projeto, tarefa, morta in desp:
             print(f"\n  {i} — {nivel} → {projeto}")
             print(f"  aberto há {fmt_h(h)}")
             print(f"  tarefa: {tarefa}")
-        print("\n  Se passou muito do tempo limite, o")
-        print("  processo morreu sem gravar o fim.")
+            # Dizer QUAL dos dois é, em vez de deixar o dono adivinhar: uma
+            # espera e a outra não vai voltar nunca.
+            print("  estado: morreu sem gravar o fim" if morta
+                  else "  estado: ainda rodando")
         print()
 
     if mem:

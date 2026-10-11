@@ -1,0 +1,13 @@
+[Unit]
+Description=Dispara o aviso de sessoes ativas a cada 30 min
+
+[Timer]
+# Pedido explicito do Igor: aviso incondicional a cada 30 min, nao so quando
+# muda (diferente do unity-pendencias, que roda no mesmo :0/30 mas so fala em
+# cima de mudanca).
+OnCalendar=*:0/30
+Persistent=false
+RandomizedDelaySec=90
+
+[Install]
+WantedBy=timers.target

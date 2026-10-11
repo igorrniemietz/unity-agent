@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""Avisa no Telegram quando uma sessão trava num pedido de aprovação sem dono.
+
+O ponto cego que custou 5h em 2026-09-10. A Unity chamou
+
+    date +%F > /home/reaper/.claude/unity-email-diario.last
+
+às 23:06:56 BRT. Caminho absoluto fora do cwd escalou para prompt de permissão
+mesmo com `Bash` inteiro no allow — e sessão de fundo não tem ninguém no terminal
+para responder. O `tool_use` nunca recebeu resultado, o `state.json` marcou
+`needs: "approve Bash: ..."` no mesmo segundo, e ela ficou ali até o WSL desligar.
+A mensagem que o dono mandou às 23:13 foi enfileirada e nunca lida.
+
+O QUE ESTA V1 ERRAVA (corrigido em 10/09/2026, à noite)
+
+A v1 disparava com `tempo == "blocked"` OU `needs` preenchido, na primeira
+detecção. O dono reclamou no mesmo dia: "está aparecendo toda hora". Medido nos
+timelines de todos os jobs:
+
+    blocked por espera do dono (normal) : 172
+    blocked por permissão (anomalia)    :   0
+
+Ou seja, `blocked` quase sempre quer dizer "ela fez uma pergunta e está esperando
+a resposta dele" — que é conversa saudável, não anomalia. O vigia estava
+alarmando justamente o caso bom, e cada mudança no texto do `detail` contava como
+episódio novo, então repetia.
+
+Agora o gatilho é só `needs` que começa com "approve" — que é literalmente um
+prompt de permissão pendente — e só depois de ESPERA_MINIMA parado. Aprovação que
+se resolve em segundos não é travamento, é o fluxo normal funcionando.
+
+O QUE ESTA V2 AINDA ERRAVA (corrigido em 11/09/2026)
+
+Ficou cego para o outro jeito de travar. Às 18:17 a Unity chamou
+`AskUserQuestion` ("como mando o arquivo pro Leko?") e o runtime escreveu
+`needs: "answer: ..."` — que não começa com "approve". Este vigia rodou 50 vezes
+em 1h48 e saiu 0 em todas. Pior: a pergunta não sai pelo Telegram, então o dono
+não sabia que existia pergunta, e o "oi" das 18:32 ficou enfileirado atrás.
+
+Filtrar por `needs` é listar jeitos de quebrar de novo — a v1 alarmava demais, a
+v2 de menos, e a lista de prefixos nunca fecha. O discriminador agora é o
+INVARIANTE: ela está bloqueada E tem mensagem dele esperando na fila
+(`inFlight.queued > 0`). Isso é ruim sempre, seja o bloqueio de permissão, de
+pergunta ou de algo que ainda não inventaram — e nunca dispara na conversa
+saudável, em que a fila está vazia porque ele já foi respondido.
+
+A regra de "approve" continua ao lado: prompt de permissão em sessão de fundo é
+travamento mesmo com a fila vazia, porque não existe quem aprove.
+"""
+import json
+import os
+import time
+from pathlib import Path
+
+JOBS = Path.home() / ".claude/jobs"
+ESTADO = Path.home() / ".local/share/unity-supervisor/bloqueio-avisado.json"
+
+# 10 minutos, pedido do dono em 10/09/2026: abaixo disso é transitório.
+ESPERA_MINIMA = int(os.environ.get("UNITY_BLOQUEIO_MIN", "10")) * 60
+IDADE_MAX = 6 * 3600      # state.json mais velho que isso é sessão morta
+
+
+def lib():
+    import importlib.machinery, importlib.util
+    ld = importlib.machinery.SourceFileLoader(
+        "unity_lib", "/home/reaper/.local/bin/unity-lib.py")
+    sp = importlib.util.spec_from_loader("unity_lib", ld)
+    m = importlib.util.module_from_spec(sp)
+    ld.exec_module(m)
+    return m
+
+
+def aguardando_aprovacao():
+    """{job: o_que_espera} das sessões paradas num prompt de permissão AGORA.
+
+    O discriminador é `needs` começando com "approve" — o texto que o próprio
+    runtime escreve quando há um prompt de permissão pendente. `state`/`tempo`
+    igual a "blocked" NÃO serve: 172 dos casos históricos eram ela esperando
+    resposta do dono, que é conversa normal.
+    """
+    achados = {}
+    if not JOBS.is_dir():
+        return achados
+    agora = time.time()
+    for d in JOBS.iterdir():
+        arq = d / "state.json"
+        if not arq.is_file():
+            continue
+        try:
+            if agora - arq.stat().st_mtime > IDADE_MAX:
+                continue
+            s = json.loads(arq.read_text(errors="replace"))
+        except Exception:
+            continue
+        needs = (s.get("needs") or "").strip()
+        if not needs:
+            continue
+        if needs.lower().startswith("approve"):
+            achados[d.name] = needs          # ninguem aprova em sessao de fundo
+            continue
+        # O invariante: bloqueada com mensagem dele parada atras do bloqueio.
+        # Vale para "answer:" (AskUserQuestion, 11/09) e para o que vier depois.
+        try:
+            fila = int((s.get("inFlight") or {}).get("queued") or 0)
+        except (TypeError, ValueError):
+            fila = 0
+        if fila > 0:
+            achados[d.name] = f"{needs}  [{fila} na fila]"
+    return achados
+
+
+def carregar():
+    try:
+        d = json.loads(ESTADO.read_text())
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def gravar(d):
+    try:
+        ESTADO.parent.mkdir(parents=True, exist_ok=True)
+        ESTADO.write_text(json.dumps(d))
+    except Exception:
+        pass
+
+
+def main():
+    atuais = aguardando_aprovacao()
+    antes = carregar()
+
+    if not atuais:
+        ESTADO.unlink(missing_ok=True)      # nada pendente: rearma tudo
+        return 0
+
+    agora = time.time()
+    estado, maduras = {}, []
+    for job, needs in atuais.items():
+        chave = f"{job}|{needs}"
+        anterior = antes.get(chave) or {}
+        desde = anterior.get("desde") or agora
+        avisado = bool(anterior.get("avisado"))
+        parado = agora - desde
+        if parado >= ESPERA_MINIMA and not avisado:
+            maduras.append((job, needs, parado))
+            avisado = True
+        estado[chave] = {"desde": desde, "avisado": avisado}
+
+    gravar(estado)
+    if not maduras:
+        return 0
+
+    total = len(atuais)
+    linhas = ["⛔ Travei esperando aprovação", ""]
+    for job, needs, parado in maduras[:3]:
+        linhas.append(f"sessão {job[:8]}, há {int(parado // 60)} min:")
+        linhas.append(needs[:220])
+        linhas.append("")
+
+    if total > len(maduras):
+        linhas.append(f"No total, {total} pedidos aguardando aprovação "
+                      f"({total - len(maduras)} ainda dentro dos "
+                      f"{ESPERA_MINIMA // 60} min).")
+    else:
+        linhas.append(f"No total, {total} pedido"
+                      f"{'s' if total > 1 else ''} aguardando aprovação.")
+
+    primeiro = maduras[0][0]
+    linhas += ["",
+               "Sessão de fundo não tem quem aprove:",
+               "fico parada até alguém mexer. Seus",
+               "pedidos ficam na fila.",
+               "",
+               "COMO ME SOLTAR AGORA",
+               f"claude attach {primeiro[:8]}",
+               "e aperte o número da opção.",
+               "Ctrl+Z volta pro shell e eu sigo.",
+               "",
+               "QUAL NÚMERO",
+               "Leia o prompt antes de apertar 1. Se ele",
+               "falar em 'permission-root relocation',",
+               "aperte 2 (não): aprovar muda a minha raiz",
+               "de permissão, e o caminho certo é",
+               "`git worktree add` pelo Bash.",
+               "",
+               "Mexer no allow não resolve sempre:",
+               "em 07/10/2026 o EnterWorktree JÁ estava",
+               "liberado e o prompt veio da relocação da",
+               "raiz de permissão, que escala acima dele."]
+    lib().send_telegram("\n".join(linhas), silent=False)
+    return 0
+
+
+try:
+    raise SystemExit(main())
+except SystemExit:
+    raise
+except Exception:
+    raise SystemExit(0)

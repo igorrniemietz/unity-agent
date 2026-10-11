@@ -1,0 +1,286 @@
+#!/home/reaper/.local/share/unity-tts/venv/bin/python
+"""Mantém o XTTS carregado na GPU e sintetiza sob demanda.
+
+  unity-fala-daemon              roda em primeiro plano (para depurar)
+  unity-fala-daemon --ensure     sobe em segundo plano se não estiver de pé
+  unity-fala-daemon --status     diz se está vivo e há quanto tempo
+  unity-fala-daemon --parar      derruba
+
+Por que existe: medido em 25/09/2026, gerar uma nota de voz com o
+`unity-fala-local` custava ~6 minutos. Só 40 segundos disso é falar — os
+outros 274 são carregar o modelo XTTS, que o script fazia a cada chamada.
+Com o modelo residente, a segunda fala em diante sai em segundos, que é o
+que torna a voz clonada usável em toda resposta do Telegram.
+
+O protocolo é uma linha de JSON por pedido, num socket unix:
+
+  ->  {"texto": "...", "refs": ["/caminho/a.wav", ...], "wav": "/saida.wav"}
+  <-  {"ok": true, "wav": "/saida.wav", "segundos": 4.1}
+  <-  {"ok": false, "erro": "..."}
+
+Um pedido por vez, de propósito: a GPU é uma só e duas sínteses ao mesmo
+tempo brigam por memória.
+"""
+import argparse
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+BASE = Path("/home/reaper/.local/share/unity-tts")
+SOCKET = Path(os.environ.get("UNITY_TTS_SOCKET", BASE / "daemon.sock"))
+PID = BASE / "daemon.pid"
+LOG = BASE / "daemon.log"
+IDIOMA = "pt"
+MODELO = "tts_models/multilingual/multi-dataset/xtts_v2"
+
+
+def vivo():
+    """True se há um daemon atendendo no socket."""
+    if not SOCKET.exists():
+        return False
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(2)
+    try:
+        s.connect(str(SOCKET))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def pedir(texto, refs, wav, timeout=600, modo="direto"):
+    """Pede uma síntese ao daemon. Devolve (ok, dados_ou_erro)."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(str(SOCKET))
+        pedido = {"texto": texto, "refs": [str(r) for r in refs],
+                  "wav": str(wav), "modo": modo}
+        s.sendall((json.dumps(pedido) + "\n").encode())
+        buf = b""
+        while not buf.endswith(b"\n"):
+            parte = s.recv(65536)
+            if not parte:
+                break
+            buf += parte
+        if not buf:
+            return False, "daemon fechou sem responder"
+        resp = json.loads(buf.decode())
+        return bool(resp.get("ok")), resp
+    except OSError as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    finally:
+        s.close()
+
+
+def _falar_direto(modelo, latentes, texto, saida_wav):
+    """Sintetiza chamando o XTTS direto, com os latentes já prontos.
+
+    O caminho do `TTS.api` reextrai os latentes do falante (ler os wavs de
+    referência, passar pelo encoder) a cada chamada. Como a voz é sempre a
+    mesma, isso é trabalho repetido — aqui os latentes são calculados uma vez
+    no start e só o texto muda.
+    """
+    import numpy as np
+    import soundfile as sf
+
+    gpt_cond, speaker_emb = latentes
+    pedacos = []
+    for frase in _frases(texto):
+        out = modelo.inference(frase, IDIOMA, gpt_cond, speaker_emb,
+                               temperature=0.7, enable_text_splitting=False)
+        pedacos.append(np.asarray(out["wav"], dtype="float32"))
+    audio = np.concatenate(pedacos) if len(pedacos) > 1 else pedacos[0]
+    taxa = getattr(modelo.config.audio, "output_sample_rate", 24000)
+    sf.write(saida_wav, audio, taxa)
+
+
+def _frases(texto, limite=220):
+    """Quebra o texto em frases; XTTS degrada em bloco longo demais."""
+    import re
+    partes, atual = [], ""
+    for pedaco in re.split(r"(?<=[.!?…])\s+", texto.strip()):
+        if not pedaco:
+            continue
+        if len(atual) + len(pedaco) + 1 <= limite:
+            atual = f"{atual} {pedaco}".strip()
+        else:
+            if atual:
+                partes.append(atual)
+            atual = pedaco
+    if atual:
+        partes.append(atual)
+    return partes or [texto]
+
+
+def servir():
+    import torch
+    from TTS.api import TTS
+
+    BASE.mkdir(parents=True, exist_ok=True)
+    if SOCKET.exists():
+        SOCKET.unlink()
+
+    t0 = time.time()
+    dispositivo = "cuda" if torch.cuda.is_available() else "cpu"
+    tts = TTS(MODELO).to(dispositivo)
+    modelo = getattr(getattr(tts, "synthesizer", None), "tts_model", None)
+    print(f"modelo pronto em {time.time() - t0:.0f}s ({dispositivo})",
+          file=sys.stderr, flush=True)
+
+    cache_latentes = {}
+
+    def latentes_de(refs):
+        """Latentes do falante, calculados uma vez por conjunto de amostras."""
+        chave = tuple(sorted(refs))
+        if chave not in cache_latentes:
+            t = time.time()
+            cache_latentes[chave] = modelo.get_conditioning_latents(
+                audio_path=list(chave), gpt_cond_len=30, max_ref_length=60)
+            print(f"latentes prontos em {time.time() - t:.1f}s "
+                  f"({len(chave)} amostra(s))", file=sys.stderr, flush=True)
+        return cache_latentes[chave]
+
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(str(SOCKET))
+    SOCKET.chmod(0o600)
+    srv.listen(4)
+    PID.write_text(str(os.getpid()))
+    print(f"ouvindo em {SOCKET}", file=sys.stderr, flush=True)
+
+    try:
+        while True:
+            conn, _ = srv.accept()
+            try:
+                conn.settimeout(600)
+                buf = b""
+                while not buf.endswith(b"\n"):
+                    parte = conn.recv(65536)
+                    if not parte:
+                        break
+                    buf += parte
+                if not buf:
+                    continue
+                pedido = json.loads(buf.decode())
+                if pedido.get("comando") == "parar":
+                    conn.sendall(b'{"ok": true, "parando": true}\n')
+                    break
+                t = time.time()
+                refs = [r for r in pedido.get("refs", []) if Path(r).is_file()]
+                if not refs:
+                    raise ValueError("nenhuma amostra de referência válida")
+                modo = pedido.get("modo", "direto")
+                if modo == "direto" and modelo is not None:
+                    try:
+                        _falar_direto(modelo, latentes_de(refs),
+                                      pedido["texto"], pedido["wav"])
+                    except Exception as exc:  # cai pro caminho conhecido
+                        print(f"caminho direto falhou ({type(exc).__name__}: "
+                              f"{exc}); usando TTS.api", file=sys.stderr,
+                              flush=True)
+                        modo = "api"
+                        tts.tts_to_file(text=pedido["texto"], speaker_wav=refs,
+                                        language=IDIOMA, file_path=pedido["wav"])
+                else:
+                    modo = "api"
+                    tts.tts_to_file(text=pedido["texto"], speaker_wav=refs,
+                                    language=IDIOMA, file_path=pedido["wav"])
+                resp = {"ok": True, "wav": pedido["wav"], "modo": modo,
+                        "segundos": round(time.time() - t, 1)}
+                print(f"falou em {resp['segundos']}s pelo modo {modo} "
+                      f"({len(pedido['texto'])} caracteres)",
+                      file=sys.stderr, flush=True)
+            except Exception as exc:  # um pedido ruim não derruba o daemon
+                resp = {"ok": False, "erro": f"{type(exc).__name__}: {exc}"}
+                print(f"erro: {resp['erro']}", file=sys.stderr, flush=True)
+            try:
+                conn.sendall((json.dumps(resp) + "\n").encode())
+            except OSError:
+                pass
+            finally:
+                conn.close()
+    finally:
+        srv.close()
+        for p in (SOCKET, PID):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+
+
+def subir_em_segundo_plano(esperar=True, limite=900):
+    """Sobe o daemon destacado do terminal. Espera ele atender, se pedido."""
+    if vivo():
+        return True
+    BASE.mkdir(parents=True, exist_ok=True)
+    log = open(LOG, "ab", buffering=0)
+    subprocess.Popen([sys.executable, os.path.abspath(__file__)],
+                     stdout=log, stderr=log, stdin=subprocess.DEVNULL,
+                     start_new_session=True)
+    if not esperar:
+        return False
+    fim = time.time() + limite
+    while time.time() < fim:
+        if vivo():
+            return True
+        time.sleep(2)
+    return False
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Daemon do TTS local (XTTS).")
+    ap.add_argument("--ensure", action="store_true",
+                    help="sobe em segundo plano se não estiver de pé")
+    ap.add_argument("--status", action="store_true")
+    ap.add_argument("--parar", action="store_true")
+    ap.add_argument("--nao-esperar", action="store_true",
+                    help="com --ensure, não espera o modelo carregar")
+    args = ap.parse_args()
+
+    if args.status:
+        if vivo():
+            idade = ""
+            if PID.is_file():
+                try:
+                    inicio = PID.stat().st_mtime
+                    idade = f", de pé há {int((time.time() - inicio) / 60)} min"
+                except OSError:
+                    pass
+            print(f"vivo em {SOCKET}{idade}")
+            return 0
+        print("parado")
+        return 1
+
+    if args.parar:
+        if not vivo():
+            print("já estava parado")
+            return 0
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(10)
+        try:
+            s.connect(str(SOCKET))
+            s.sendall(b'{"comando": "parar"}\n')
+            s.recv(4096)
+        except OSError:
+            pass
+        finally:
+            s.close()
+        print("parado")
+        return 0
+
+    if args.ensure:
+        ok = subir_em_segundo_plano(esperar=not args.nao_esperar)
+        print("pronto" if ok else "subindo (modelo ainda carregando)")
+        return 0 if ok else 1
+
+    servir()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

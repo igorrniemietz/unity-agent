@@ -1,0 +1,525 @@
+#!/usr/bin/env python3
+"""Relatório de consumo de tokens por janela de 5h do Claude no Telegram.
+
+Detecta a virada da janela de 5h do Claude (quando session_pct cai em relacao
+a ultima medicao do ai-usagebar) e envia ao Telegram um resumo com a contagem
+real de tokens gastos na janela encerrada, discriminando os maiores projetos,
+o detalhe de ferramentas e screenshots da sessao #1, o consumo do DeepSeek e as
+delegacoes do orquestrador no mesmo intervalo.
+
+Nao faz chamadas de LLM ou APIs externas pagas: le apenas arquivos locais
+(transcripts do Claude em ~/.claude/projects, ledger do llm-router, delegacoes
+e saida local do ai-usagebar).
+
+Uso:
+    unity-janela-tokens             Execucao normal (via timer do systemd)
+    unity-janela-tokens --dry-run   Imprime o relatorio sem enviar nem alterar estado
+"""
+import collections
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import date, datetime, timedelta
+from pathlib import Path
+
+# Caminhos locais reutilizados
+LEDGER = Path.home() / ".local/share/llm-router"
+DELEGACOES = Path.home() / ".local/share/unity-orquestrador/delegacoes.jsonl"
+USAGEBAR = "/home/reaper/.local/bin/ai-usagebar"
+LIB_PATH = "/home/reaper/.local/bin/unity-lib.py"
+STATE_DIR = Path.home() / ".local/share/unity-janela-tokens"
+STATE_FILE = STATE_DIR / "estado.json"
+CLAUDE_PROJECTS = Path.home() / ".claude/projects"
+
+
+def carregar_lib():
+    """Importa unity-lib dinamicamente sem poluir namespace."""
+    import importlib.util
+    try:
+        spec = importlib.util.spec_from_file_location("unity_lib", LIB_PATH)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
+
+
+def _texto_ai_usagebar(bruto):
+    """Limpa tags Pango e caracteres especiais ao final da string."""
+    texto = re.sub("<[^>]+>", "", bruto)
+    return re.sub(r"[^\x00-\x7F]+\s*$", "", texto).rstrip()
+
+
+def claude_sessao():
+    """Le porcentagem da sessao de 5h e tempo para reset.
+    
+    Retorna (pct_int, reset_str) ou (None, None) se falhar.
+    """
+    try:
+        p = subprocess.run(
+            [USAGEBAR, "--vendor", "anthropic", "--json",
+             "--format", "{session_pct}|{session_reset}"],
+            capture_output=True, text=True, timeout=25)
+        if p.returncode != 0:
+            return None, None
+        texto = _texto_ai_usagebar(json.loads(p.stdout).get("text", ""))
+        partes = texto.split("|")
+        if len(partes) >= 2:
+            return int(partes[0].strip()), partes[1].strip()
+    except Exception:
+        pass
+    return None, None
+
+
+def carregar_estado():
+    """Le o estado anterior. Retorna dict com last_pct e window_start_ts."""
+    if not STATE_FILE.exists():
+        return None
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except Exception:
+        return None
+
+
+def salvar_estado(last_pct, window_start_ts):
+    """Grava o estado atomico em disco."""
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps({
+            "last_pct": last_pct,
+            "window_start_ts": window_start_ts,
+            "atualizado_em": datetime.now().isoformat()
+        }, indent=2))
+        tmp.replace(STATE_FILE)
+    except Exception:
+        pass
+
+
+def compactar_nome_projeto(caminho_ou_dir):
+    """Encurta o nome do projeto/diretorio para caber na linha do Telegram."""
+    if not caminho_ou_dir:
+        return "geral"
+    s = str(caminho_ou_dir).strip()
+    home = str(Path.home())
+    if s in ("-home-reaper", home, "~"):
+        return "orquestrador"
+    if s.startswith(home):
+        s = s[len(home):].lstrip("/")
+        if not s:
+            return "orquestrador"
+    if "/scratchpad/" in s:
+        s = s.split("/scratchpad/")[-1] or "scratchpad"
+    elif "-scratchpad-" in s:
+        s = s.split("-scratchpad-")[-1] or "scratchpad"
+    elif s.startswith("-tmp-claude-"):
+        if "scratchpad" in s:
+            sub = s.split("scratchpad")[-1].lstrip("-/")
+            s = sub if sub else "scratchpad"
+    elif s.startswith("-home-reaper-"):
+        raw = s[len("-home-reaper-"):]
+        if raw.startswith("projetos-"):
+            s = raw[len("projetos-"):]
+        elif raw.startswith("-local-bin") or raw == "-local-bin":
+            s = ".local/bin"
+        else:
+            s = raw
+    elif s.startswith("projetos/"):
+        s = s[len("projetos/"):]
+
+    s = s.rstrip("/")
+    if len(s) > 16:
+        parts = s.split("/")
+        if len(parts) > 1:
+            s = parts[-1]
+        if len(s) > 16:
+            s = s[:15] + "…"
+    return s or "geral"
+
+
+def simplificar_nome_ferramenta(nome):
+    """Encurta o identificador de ferramenta retirando prefixos longos de MCP."""
+    if not nome:
+        return "desconhecido"
+    if nome.startswith("mcp__claude-in-chrome__"):
+        return nome[len("mcp__claude-in-chrome__"):]
+    if nome.startswith("mcp__ai-memory__"):
+        return nome[len("mcp__ai-memory__"):]
+    if nome.startswith("mcp__plugin_telegram_telegram__"):
+        return nome[len("mcp__plugin_telegram_telegram__"):]
+    if nome.startswith("mcp__"):
+        parts = nome.split("__")
+        return parts[-1]
+    return nome
+
+
+def analisar_ferramentas_sessao(caminho_sessao, ini_ts, fim_ts):
+    """Conta chamadas de ferramentas e screenshots na sessao top-1 na janela.
+    
+    Retorna (contagem_Counter, total_screenshots, total_ferramentas).
+    """
+    contagem = collections.Counter()
+    screenshots = 0
+    total = 0
+    try:
+        with open(caminho_sessao, "r", encoding="utf-8", errors="ignore") as fh:
+            for linha in fh:
+                if "tool_use" not in linha:
+                    continue
+                try:
+                    d = json.loads(linha)
+                except Exception:
+                    continue
+
+                raw_ts = d.get("timestamp") or (d.get("message") or {}).get("timestamp")
+                if raw_ts:
+                    try:
+                        dt = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
+                        msg_ts = dt.timestamp()
+                        if not (ini_ts <= msg_ts < fim_ts):
+                            continue
+                    except Exception:
+                        pass
+
+                msg = d.get("message")
+                if not isinstance(msg, dict):
+                    continue
+                content = msg.get("content")
+                if not isinstance(content, list):
+                    continue
+
+                for c in content:
+                    if not (isinstance(c, dict) and c.get("type") == "tool_use"):
+                        continue
+                    nome_bruto = c.get("name") or ""
+                    nome = simplificar_nome_ferramenta(nome_bruto)
+                    contagem[nome] += 1
+                    total += 1
+
+                    inp = c.get("input")
+                    if isinstance(inp, dict):
+                        # Chamada direta computer(action="screenshot")
+                        if "computer" in nome_bruto and inp.get("action") == "screenshot":
+                            screenshots += 1
+                        # Chamada em lote browser_batch com passo de screenshot
+                        elif "browser_batch" in nome_bruto:
+                            acoes = inp.get("actions") or inp.get("steps") or inp.get("calls")
+                            if isinstance(acoes, list):
+                                for act in acoes:
+                                    if isinstance(act, dict):
+                                        act_inp = act.get("input") or {}
+                                        act_name = act.get("name") or ""
+                                        if "computer" in act_name and isinstance(act_inp, dict) and act_inp.get("action") == "screenshot":
+                                            screenshots += 1
+                                        elif act.get("action") == "screenshot":
+                                            screenshots += 1
+    except Exception:
+        pass
+    return contagem, screenshots, total
+
+
+def claude_tokens_janela(ini_ts, fim_ts):
+    """Soma tokens dos transcripts do Claude dentro do intervalo [ini_ts, fim_ts).
+    
+    Retorna (totais_dict, top_projetos_lista, top_sessao_dict).
+    """
+    totais = {
+        "cache_read": 0,
+        "cache_creation": 0,
+        "output": 0,
+        "input": 0,
+        "total": 0
+    }
+    por_projeto = {}
+    sessoes = []
+    vistos = set()
+
+    if not CLAUDE_PROJECTS.exists():
+        return totais, [], None
+
+    try:
+        arquivos = list(CLAUDE_PROJECTS.glob("*/*.jsonl"))
+    except Exception:
+        arquivos = []
+
+    for arq in arquivos:
+        try:
+            # Filtro rapido de mtime para evitar ler transcripts antigos
+            if arq.stat().st_mtime < ini_ts:
+                continue
+        except Exception:
+            continue
+
+        parent_dir = arq.parent.name
+        sess_total = 0
+        sess_cwd = None
+
+        try:
+            with open(arq, "r", encoding="utf-8", errors="ignore") as fh:
+                for linha in fh:
+                    if "usage" not in linha:
+                        continue
+                    try:
+                        d = json.loads(linha)
+                    except Exception:
+                        continue
+
+                    msg = d.get("message")
+                    if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                        continue
+                    usage = msg.get("usage")
+                    if not isinstance(usage, dict):
+                        continue
+
+                    raw_ts = d.get("timestamp") or msg.get("timestamp")
+                    if not raw_ts:
+                        continue
+                    try:
+                        dt = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
+                        msg_ts = dt.timestamp()
+                    except Exception:
+                        continue
+
+                    if not (ini_ts <= msg_ts < fim_ts):
+                        continue
+
+                    # Deduplica por id da mensagem ou uuid da linha
+                    msg_id = msg.get("id") or d.get("uuid")
+                    if msg_id:
+                        if msg_id in vistos:
+                            continue
+                        vistos.add(msg_id)
+
+                    if not sess_cwd and d.get("cwd"):
+                        sess_cwd = d.get("cwd")
+
+                    cr = usage.get("cache_read_input_tokens") or 0
+                    cc = usage.get("cache_creation_input_tokens") or 0
+                    out = usage.get("output_tokens") or 0
+                    inp = usage.get("input_tokens") or 0
+                    soma = cr + cc + out + inp
+
+                    totais["cache_read"] += cr
+                    totais["cache_creation"] += cc
+                    totais["output"] += out
+                    totais["input"] += inp
+                    totais["total"] += soma
+                    sess_total += soma
+        except Exception:
+            continue
+
+        if sess_total > 0:
+            proj = compactar_nome_projeto(sess_cwd or parent_dir)
+            por_projeto[proj] = por_projeto.get(proj, 0) + sess_total
+            sessoes.append({
+                "file": arq,
+                "proj": proj,
+                "total": sess_total
+            })
+
+    top_projetos = sorted(por_projeto.items(), key=lambda x: -x[1])[:3]
+    top_sess = max(sessoes, key=lambda s: s["total"]) if sessoes else None
+    return totais, top_projetos, top_sess
+
+
+def deepseek_janela(ini_ts, fim_ts):
+    """Calcula tokens de entrada, saida e custo USD no llm-router na janela."""
+    if not LEDGER.exists():
+        return 0, 0, 0.0
+
+    try:
+        dt_ini = datetime.fromtimestamp(ini_ts)
+        dt_fim = datetime.fromtimestamp(fim_ts)
+    except Exception:
+        return 0, 0, 0.0
+
+    dias = []
+    curr = dt_ini.date()
+    fim_date = dt_fim.date()
+    while curr <= fim_date:
+        dias.append(curr)
+        curr += timedelta(days=1)
+
+    tin = tout = 0
+    custo = 0.0
+    for d in dias:
+        p = LEDGER / f"{d.isoformat()}.jsonl"
+        if not p.exists():
+            continue
+        try:
+            for linha in p.read_text(encoding="utf-8", errors="ignore").splitlines():
+                try:
+                    r = json.loads(linha)
+                except Exception:
+                    continue
+                if r.get("error"):
+                    continue
+                ts = r.get("ts") or 0
+                if ini_ts <= ts < fim_ts:
+                    tin += r.get("prompt_tokens") or 0
+                    tout += r.get("completion_tokens") or 0
+                    custo += r.get("cost_usd") or 0.0
+        except Exception:
+            continue
+    return tin, tout, custo
+
+
+def delegacoes_janela(ini_ts, fim_ts):
+    """Conta delegacoes Gemini e Claude finalizadas/iniciadas na janela."""
+    if not DELEGACOES.exists():
+        return 0, 0
+    try:
+        vistos = {}
+        for linha in DELEGACOES.read_text(encoding="utf-8", errors="ignore").splitlines():
+            try:
+                r = json.loads(linha)
+            except Exception:
+                continue
+            if "id" in r:
+                vistos[r["id"]] = r
+
+        g = c = 0
+        for r in vistos.values():
+            ts = r.get("terminado_em") or r.get("iniciado_em") or 0
+            if ini_ts <= ts < fim_ts:
+                nivel = r.get("nivel") or ""
+                if nivel == "gemini":
+                    g += 1
+                elif nivel in ("claude", "sonnet") or "claude" in nivel:
+                    c += 1
+        return g, c
+    except Exception:
+        return 0, 0
+
+
+def fmt_tok(n):
+    """Formata contagem de tokens de forma compacta (k, M, B)."""
+    if n >= 1_000_000_000:
+        return f"{n/1_000_000_000:.1f}B".replace(".", ",").replace(",0B", "B")
+    if n >= 1_000_000:
+        return f"{n/1_000_000:.1f}M".replace(".", ",").replace(",0M", "M")
+    if n >= 1_000:
+        return f"{n/1000:.1f}k".replace(".", ",").replace(",0k", "k")
+    return str(n)
+
+
+def brl(valor):
+    """Duas casas para leitura rapida; tres se for fracionario menor que 0,01."""
+    if valor and valor < 0.01:
+        return f"{valor:.3f}".replace(".", ",")
+    return f"{valor:.2f}".replace(".", ",")
+
+
+def montar_relatorio(ini_ts, fim_ts, pct=None):
+    """Constroi a mensagem de texto puro no padrao estrito do Telegram."""
+    c_tot, top_proj, top_sess = claude_tokens_janela(ini_ts, fim_ts)
+    ds_in, ds_out, ds_custo = deepseek_janela(ini_ts, fim_ts)
+    g_del, c_del = delegacoes_janela(ini_ts, fim_ts)
+
+    linhas = []
+    # 1 emoji no inicio da mensagem, texto puro em pt-BR
+    if pct is not None:
+        linhas.append(f"📊 Janela fechada ({pct}% da cota)")
+    else:
+        linhas.append("📊 Janela Claude encerrada")
+    linhas.append("")
+
+    tot = c_tot["total"]
+    if tot > 0:
+        linhas.append(f"Total: {fmt_tok(tot)} tokens")
+        if c_tot["cache_read"]:
+            cr = c_tot["cache_read"]
+            linhas.append(f"  ↳ {fmt_tok(cr)} leitura cache")
+        if c_tot["cache_creation"]:
+            cc = c_tot["cache_creation"]
+            linhas.append(f"  ↳ {fmt_tok(cc)} criacao cache")
+        if c_tot["output"]:
+            out = c_tot["output"]
+            linhas.append(f"  ↳ {fmt_tok(out)} saida")
+    else:
+        linhas.append("Total: 0 tokens no Claude")
+
+    # Detalhe dos maiores projetos e analise de ferramentas da sessao #1
+    if top_proj and any(tok > 0 for _, tok in top_proj):
+        linhas.append("")
+        p1_nome, p1_tok = top_proj[0]
+        linhas.append(f"Top: {p1_nome} {fmt_tok(p1_tok)} tok")
+
+        if top_sess and top_sess.get("file"):
+            ferrs, n_shots, tot_ferrs = analisar_ferramentas_sessao(
+                top_sess["file"], ini_ts, fim_ts
+            )
+            if ferrs:
+                top_f = ferrs.most_common(3)
+                for name, cnt in top_f:
+                    linhas.append(f"  {cnt} {name}")
+            if n_shots > 0:
+                linhas.append(f"  {n_shots} screenshots")
+                if n_shots > 20:
+                    linhas.append("  muitos screenshots — ver")
+                    linhas.append("  PROMPT-UNITY-VAGAS.md")
+
+        outros = [p for p in top_proj[1:] if p[1] > 0]
+        if outros:
+            for p_nome, p_tok in outros:
+                linhas.append(f"• {p_nome}: {fmt_tok(p_tok)} tok")
+
+    linhas.append("")
+    tot_ds = ds_in + ds_out
+    linhas.append(f"DeepSeek: US$ {brl(ds_custo)} · {fmt_tok(tot_ds)} tok")
+    linhas.append(f"Delegacoes: {g_del} Gemini, {c_del} Claude")
+
+    return "\n".join(linhas)
+
+
+def main():
+    dry_run = "--dry-run" in sys.argv
+    agora = time.time()
+    estado = carregar_estado()
+    curr_pct, _ = claude_sessao()
+
+    if dry_run:
+        if estado and estado.get("window_start_ts") and (agora - estado["window_start_ts"] > 60):
+            ini = estado["window_start_ts"]
+        else:
+            ini = agora - 5 * 3600
+        display_pct = curr_pct if curr_pct is not None else (estado.get("last_pct") if estado else 0)
+        texto = montar_relatorio(ini, agora, pct=display_pct)
+        print(texto)
+        return 0
+
+    # Se a leitura falhou, encerra silenciosamente para nao poluir logs
+    if curr_pct is None:
+        return 0
+
+    # Primeiro ciclo: inicializa estado e sai
+    if estado is None:
+        salvar_estado(curr_pct, agora)
+        return 0
+
+    last_pct = estado.get("last_pct", curr_pct)
+    window_start_ts = estado.get("window_start_ts", agora)
+
+    # Virada de janela detectada (o contador % caiu)
+    if curr_pct < last_pct:
+        window_end_ts = agora
+        texto = montar_relatorio(window_start_ts, window_end_ts, pct=last_pct)
+        lib = carregar_lib()
+        if lib and hasattr(lib, "send_telegram"):
+            lib.send_telegram(texto, silent=False)
+        salvar_estado(curr_pct, agora)
+    else:
+        # Atualiza last_pct e preserva o inicio da janela
+        salvar_estado(curr_pct, window_start_ts)
+
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception:
+        sys.exit(0)

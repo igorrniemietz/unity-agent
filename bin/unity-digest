@@ -156,13 +156,19 @@ def main():
         f"Dados:\n{dados}"
     )
 
-    texto, erro = lib.llm(prompt, client="supervisor", max_tokens=1500)
+    # 4000, nao 1500: medido em 10/09/2026 que o raciocinio sozinho do
+    # deepseek-v4-flash consome 700-1500 tokens neste prompt, e com o teto em
+    # 1500 ele era cortado ANTES de escrever a primeira letra -- 10 falhas em
+    # 7 dias, todas cobradas, todas com a mensagem inutil "erro: None". O
+    # unity-lib.llm agora reforca sozinho quando isso acontece; comecar largo
+    # evita pagar duas chamadas por digest.
+    texto, erro = lib.llm(prompt, client="supervisor", max_tokens=4000)
     if erro or not texto:
         print(f"falha ao gerar o digest: {erro}", file=sys.stderr)
         return 1
 
     corpo = f"📊 Andamento — {agora}\n\n{texto.strip()}"
-    if lib.send_telegram(corpo, silent=True):
+    if lib.send_telegram(corpo, silent=True, rodape=True):
         STATE.mkdir(parents=True, exist_ok=True)
         WATERMARK.write_text(json.dumps(nova_marca))
         print(f"digest enviado ({len(ativos)} projeto(s)).")

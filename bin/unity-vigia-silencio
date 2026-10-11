@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""Avisa quando uma mensagem do dono fica sem resposta — seja qual for a causa.
+
+POR QUE ESTE É DIFERENTE DOS OUTROS VIGIAS
+
+Em 10/09/2026 havia 6 vigias e 12 timers, e mesmo assim uma mensagem das 23:13
+ficou 5h sem resposta sem ninguém notar. O motivo é estrutural: cada vigia
+existente pergunta por uma CAUSA já conhecida —
+
+    unity-vigia-login     "a credencial expirou?"      (21/08)
+    unity-heartbeat       "ela está busy há muito?"    (04/08)
+    unity-handoff-vigia   "está ociosa há 1h30?"       (19/08)
+    unity-vigia-bloqueio  "travou em permissão?"       (10/09)
+    unity-exige-resposta  "o turno fechou sem reply?"  (19/08, hook Stop)
+
+Cada um nasceu no dia seguinte a um incidente, olhando o sintoma daquele
+incidente. A lista de causas é infinita e sempre vai estar um incidente atrás;
+os buracos ficam ENTRE os vigias. Sessão travada em prompt de permissão não está
+"busy" nem "ociosa" nem "sem credencial", e o hook Stop não roda porque o turno
+nunca fecha.
+
+Este aqui não pergunta por causa nenhuma. Ele checa o único invariante que
+importa do lado do dono: **mensagem que ele mandou tem resposta**. Se não tem, o
+aviso sai — não importa se foi permissão, login, cota, daemon caído, delegação
+fantasma ou algo que ainda não aconteceu. É o mesmo salto de "listar os jeitos
+de quebrar" para "declarar o que precisa ser verdade".
+
+COMO SABE QUE FOI RESPONDIDA
+
+Do transcript, que é a fonte que enxerga dentro da sessão sem falar com o modelo
+(um agente travado não consegue avisar que travou):
+  entrada = `queue-operation/enqueue` com `<channel source="plugin:telegram"`,
+            ou uma mensagem `user` já consumida com o mesmo marcador;
+  saída   = chamada de `mcp__plugin_telegram_telegram__reply`.
+Se a entrada mais nova não tem nenhum reply depois dela, ela está sem resposta.
+
+NÃO ALARMA À TOA
+
+Enquanto o heartbeat está dizendo "⏳ ainda trabalhando", o dono NÃO está no
+silêncio — ele sabe que ela está mexendo. Só vira alarme quando nem isso está
+saindo.
+"""
+import json
+import os
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+PROJ = Path.home() / ".claude/projects/-home-reaper"
+ESTADO = Path.home() / ".local/share/unity-supervisor/silencio-avisado.json"
+HEARTBEAT = Path.home() / ".local/share/unity-supervisor/heartbeat-sessao.json"
+
+LIMITE = int(os.environ.get("UNITY_SILENCIO_MIN", "12")) * 60
+JANELA = 24 * 3600      # mensagem de ontem nao vira alarme hoje
+HB_FRESCO = 6 * 60      # heartbeat mais novo que isso = ele ja esta avisando
+
+
+def lib():
+    import importlib.machinery, importlib.util
+    ld = importlib.machinery.SourceFileLoader(
+        "unity_lib", "/home/reaper/.local/bin/unity-lib.py")
+    sp = importlib.util.spec_from_loader("unity_lib", ld)
+    m = importlib.util.module_from_spec(sp)
+    ld.exec_module(m)
+    return m
+
+
+def _quando(ts):
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0.0
+
+
+def _texto_do_canal(bruto):
+    """O que ele escreveu, sem o envelope <channel ...>."""
+    import re
+    m = re.search(r"<channel\b[^>]*>(.*?)</channel>", bruto, re.S)
+    return (m.group(1).strip() if m else bruto).strip()
+
+
+def _id_da_mensagem(bruto):
+    import re
+    m = re.search(r'message_id="(\d+)"', bruto)
+    # Sem message_id, o proprio texto identifica: dedup por conteudo e melhor
+    # que dedup nenhum, e o alarme repetido cansa mais que o alarme atrasado.
+    return m.group(1) if m else str(abs(hash(bruto)))
+
+
+def varrer():
+    """(entradas, saidas) da ultima JANELA, ordenadas por tempo."""
+    entradas, saidas = [], []
+    agora = time.time()
+    if not PROJ.is_dir():
+        return entradas, saidas
+    for arq in PROJ.glob("*.jsonl"):
+        try:
+            if agora - arq.stat().st_mtime > JANELA:
+                continue
+            conteudo = arq.read_text(errors="replace")
+        except OSError:
+            continue
+        for linha in conteudo.splitlines():
+            if "<channel" not in linha and "telegram__reply" not in linha:
+                continue
+            try:
+                d = json.loads(linha)
+            except Exception:
+                continue
+            t = _quando(d.get("timestamp") or "")
+            if not t or agora - t > JANELA:
+                continue
+            bruto = d.get("content") or ""
+            if (d.get("type") == "queue-operation"
+                    and d.get("operation") == "enqueue"
+                    and 'source="plugin:telegram' in bruto):
+                entradas.append((t, _id_da_mensagem(bruto), _texto_do_canal(bruto)))
+                continue
+            m = d.get("message") or {}
+            c = m.get("content")
+            if d.get("type") == "user" and isinstance(c, str) and 'source="plugin:telegram' in c:
+                entradas.append((t, _id_da_mensagem(c), _texto_do_canal(c)))
+            elif d.get("type") == "assistant" and isinstance(c, list):
+                for b in c:
+                    if (isinstance(b, dict) and b.get("type") == "tool_use"
+                            and "telegram__reply" in (b.get("name") or "")):
+                        saidas.append(t)
+    entradas.sort()
+    saidas.sort()
+    return entradas, saidas
+
+
+def heartbeat_falando():
+    """O dono esta sendo avisado de que ela trabalha? Entao nao ha silencio."""
+    try:
+        return time.time() - HEARTBEAT.stat().st_mtime < HB_FRESCO
+    except OSError:
+        return False
+
+
+def main():
+    entradas, saidas = varrer()
+    if not entradas:
+        return 0
+
+    # A mais nova manda: se ela foi respondida, nao ha silencio agora.
+    quando, msg_id, texto = entradas[-1]
+    if any(s > quando for s in saidas):
+        ESTADO.unlink(missing_ok=True)      # respondeu: rearma
+        return 0
+
+    parado = time.time() - quando
+    if parado < LIMITE:
+        return 0
+    if heartbeat_falando():
+        return 0
+
+    try:
+        if json.loads(ESTADO.read_text()).get("msg_id") == msg_id:
+            return 0                         # ja avisei desta
+    except Exception:
+        pass
+
+    lib().send_telegram(
+        "🔇 Sua mensagem está sem resposta\n\n"
+        f"há {int(parado // 60)} min, desde {datetime.fromtimestamp(quando):%H:%M}:\n"
+        f"\"{texto[:150]}\"\n\n"
+        "Ainda não sei por quê — pode ser permissão,\n"
+        "login, cota ou queda. Rode `unity-pendencias`\n"
+        "para o retrato, ou me mande 'oi' para testar\n"
+        "o canal.",
+        silent=False)
+
+    ESTADO.parent.mkdir(parents=True, exist_ok=True)
+    ESTADO.write_text(json.dumps({"msg_id": msg_id, "avisado": time.time()}))
+    return 0
+
+
+try:
+    raise SystemExit(main())
+except SystemExit:
+    raise
+except Exception:
+    raise SystemExit(0)

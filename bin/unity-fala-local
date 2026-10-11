@@ -1,0 +1,174 @@
+#!/home/reaper/.local/share/unity-tts/venv/bin/python
+"""Texto -> nota de voz em OGG/Opus, com voz CLONADA, 100% local.
+
+  unity-fala-local "Bom dia"                    usa a voz padrão
+  unity-fala-local --ref a.wav --ref b.wav ...  mistura as amostras que você der
+  unity-fala-local --sem-daemon "..."           carrega o modelo aqui (lento)
+  unity-fala-local --texto "..."                só imprime o texto limpo
+
+Mesma saída do `unity-fala` (caminho do .ogg no stdout), mesma limpeza de
+texto — a diferença é o motor: em vez do edge-tts, que é serviço da Microsoft
+e precisa de rede, aqui roda o XTTS v2 na GPU da própria caixa. Nada do texto
+sai da máquina, e a voz é a da amostra de referência.
+
+As amostras são sintéticas de propósito (vozes do edge-tts, geradas uma vez e
+guardadas): dão o clima de assistente sem clonar a voz de uma pessoa real, que
+é problema de direito e não de tecnologia.
+
+Quem carrega o modelo é o `unity-fala-daemon`, que fica residente na GPU —
+sem ele cada fala custaria ~4min30 só para subir o XTTS. Este script sobe o
+daemon sozinho na primeira chamada e depois só conversa com ele.
+"""
+import argparse
+import importlib.util
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+BASE = Path("/home/reaper/.local/share/unity-tts")
+# A voz padrão é a MISTURA de duas amostras: o timbre de assistente da
+# jarvis-br (voz britânica) com a fonética da nativo-antonio (pt-BR de
+# verdade). O XTTS aceita várias referências e faz a média entre elas.
+# Escolha do dono em 25/09/2026, ouvindo quatro variantes lado a lado: a
+# ref britânica sozinha soava estranha nos acentos, porque a amostra é uma
+# voz inglesa falando português e o clone herda o sotaque.
+REFS_PADRAO = [BASE / "refs/jarvis-br.wav", BASE / "refs/nativo-antonio.wav"]
+IDIOMA = "pt"
+FFMPEG = "/usr/bin/ffmpeg"
+BITRATE = "48k"
+
+
+def limpar_para_fala(texto):
+    """Reaproveita a limpeza do unity-fala — uma regra só, num lugar só."""
+    caminho = Path("/home/reaper/.local/bin/unity-fala")
+    spec = importlib.util.spec_from_loader("unity_fala", None)
+    mod = importlib.util.module_from_spec(spec)
+    mod.__dict__["__name__"] = "unity_fala"
+    exec(compile(caminho.read_text(), str(caminho), "exec"), mod.__dict__)
+    return mod.limpar_para_fala(texto)
+
+
+def carregar_daemon():
+    """Importa o unity-fala-daemon como módulo, se ele estiver instalado."""
+    caminho = Path("/home/reaper/.local/bin/unity-fala-daemon")
+    if not caminho.is_file():
+        return None
+    spec = importlib.util.spec_from_loader("unity_fala_daemon", None)
+    mod = importlib.util.module_from_spec(spec)
+    mod.__dict__["__name__"] = "unity_fala_daemon"
+    exec(compile(caminho.read_text(), str(caminho), "exec"), mod.__dict__)
+    return mod
+
+
+def sintetizar(texto, refs, destino_wav, usar_daemon=True):
+    """Fala o texto. Prefere o daemon; carrega o modelo aqui se ele não subir.
+
+    O caminho lento (carregar o XTTS neste processo) custa ~4min30 e existe
+    só como rede de segurança — em uso normal quem fala é o daemon, que já
+    tem o modelo na GPU e responde em segundos.
+    """
+    if usar_daemon:
+        d = carregar_daemon()
+        if d is not None:
+            if not d.vivo():
+                d.subir_em_segundo_plano(esperar=True)
+            if d.vivo():
+                ok, resp = d.pedir(texto, refs, destino_wav)
+                if ok:
+                    return f"daemon/{resp.get('segundos')}s"
+                print(f"daemon não deu conta ({resp}), carregando aqui",
+                      file=sys.stderr)
+
+    # Import tardio: carregar o torch custa segundos, e --texto não precisa.
+    import torch
+    from TTS.api import TTS
+
+    dispositivo = "cuda" if torch.cuda.is_available() else "cpu"
+    tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(dispositivo)
+    tts.tts_to_file(text=texto, speaker_wav=[str(r) for r in refs],
+                    language=IDIOMA, file_path=str(destino_wav))
+    return dispositivo
+
+
+def wav_para_ogg(entrada, saida):
+    proc = subprocess.run(
+        [FFMPEG, "-v", "error", "-y", "-i", str(entrada),
+         "-ac", "1", "-ar", "48000", "-c:a", "libopus", "-b:a", BITRATE,
+         str(saida)],
+        capture_output=True, text=True)
+    if proc.returncode != 0 or not Path(saida).exists():
+        print(f"ffmpeg falhou: {proc.stderr.strip()}", file=sys.stderr)
+        return False
+    return True
+
+
+def main():
+    ap = argparse.ArgumentParser(description="TTS local com voz clonada.")
+    ap.add_argument("--ref", action="append", metavar="WAV",
+                    help="wav de referência (o timbre a imitar); pode repetir "
+                         "para misturar amostras")
+    ap.add_argument("--sem-daemon", action="store_true",
+                    help="carrega o modelo neste processo (lento)")
+    ap.add_argument("--texto", action="store_true",
+                    help="imprime só o texto limpo, sem gerar áudio")
+    ap.add_argument("-v", "--info", action="store_true")
+    ap.add_argument("palavras", nargs="*")
+    args = ap.parse_args()
+
+    bruto = " ".join(args.palavras).strip()
+    if not bruto and not sys.stdin.isatty():
+        bruto = sys.stdin.read().strip()
+    if not bruto:
+        print('uso: unity-fala-local "<texto>"', file=sys.stderr)
+        return 2
+
+    texto = limpar_para_fala(bruto)
+    if args.texto:
+        print(texto)
+        return 0
+
+    refs = [Path(r) for r in (args.ref or REFS_PADRAO)]
+    faltando = [r for r in refs if not r.is_file()]
+    if faltando:
+        print("amostra de referência não encontrada: "
+              + ", ".join(str(r) for r in faltando), file=sys.stderr)
+        return 1
+
+    fd, wav = tempfile.mkstemp(prefix="unity-fala-local-", suffix=".wav")
+    os.close(fd)
+    fd, ogg = tempfile.mkstemp(prefix="unity-fala-local-", suffix=".ogg")
+    os.close(fd)
+
+    try:
+        dispositivo = sintetizar(texto, refs, wav,
+                                 usar_daemon=not args.sem_daemon)
+        if args.info:
+            nomes = "+".join(r.stem for r in refs)
+            print(f"device={dispositivo} ref={nomes} "
+                  f"({len(texto)} caracteres)", file=sys.stderr)
+        if not wav_para_ogg(wav, ogg):
+            os.unlink(ogg)
+            return 1
+    except Exception as exc:
+        print(f"falha ao gerar a fala: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
+        for p in (ogg,):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+        return 1
+    finally:
+        try:
+            os.unlink(wav)
+        except OSError:
+            pass
+
+    print(ogg)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

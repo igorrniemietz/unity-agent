@@ -12,7 +12,8 @@
     "o access.json pode ser editado à mão, o servidor o relê a cada mensagem."
   ],
   "enabledPlugins": {
-    "telegram@claude-plugins-official": true
+    "telegram@claude-plugins-official": true,
+    "vercel@claude-plugins-official": false
   },
   "permissions": {
     "_comment_defaultMode": [
@@ -32,6 +33,10 @@
       "junto a confirmação de exclusão, a única coisa que o dono quis manter."
     ],
     "defaultMode": "default",
+    "_comment_additionalDirectories": "2026-09-10: a Unity travou 5h esperando aprovacao de `date +%F > /home/reaper/.claude/unity-email-diario.last`. O comando estava liberado (Bash inteiro esta no allow), mas o caminho ABSOLUTO fez o analisador ver escrita fora do workspace (cwd era ~/projetos/um-projeto) e escalar para prompt de permissao -- que numa sessao de fundo nao tem quem responda. Com `~/...` nao expandido isso nunca aconteceu em 10 execucoes anteriores. Declarar ~/.claude aqui tira o diretorio de estado dela do 'fora do workspace'.",
+    "additionalDirectories": [
+      "/home/reaper/.claude"
+    ],
     "_comment_ai_memory": [
       "As ferramentas do ai-memory são enumeradas uma a uma em vez do atalho",
       "`mcp__ai-memory`, que libera o servidor inteiro. Motivo: não depender de",
@@ -69,8 +74,8 @@
       "Artifact",
       "ToolSearch",
       "Monitor",
+      "ListAgents",
       "SendMessage",
-      "AskUserQuestion",
       "ReportFindings",
       "BashOutput",
       "KillShell",
@@ -120,7 +125,7 @@
       "",
       "Ler mídia de projeto é trabalho de executor, não de porteira: quem",
       "audita o site é o agente despachado, na sessão dele, que morre no fim e",
-      "leva o contexto junto. O anexo que o Igor manda pelo Telegram NÃO é",
+      "leva o contexto junto. O anexo que o dono manda pelo Telegram NÃO é",
       "afetado — ele chega por download_attachment, fora de ~/projetos."
     ],
     "_comment_ask_virou_deny": [
@@ -140,6 +145,7 @@
     ],
     "ask": [],
     "deny": [
+      "AskUserQuestion",
       "Bash(rm *)",
       "Bash(rmdir *)",
       "Bash(shred *)",
@@ -163,10 +169,34 @@
       "Read(/home/reaper/projetos/**/*.avif)",
       "Read(/home/reaper/projetos/**/*.pdf)"
     ],
-    "disableBypassPermissionsMode": "disable"
+    "disableBypassPermissionsMode": "disable",
+    "_comment_AskUserQuestion": [
+      "2026-09-11: a Unity travou 1h48 numa chamada de AskUserQuestion.",
+      "Ela perguntou 'como mando o arquivo pro Leko?' as 18:17 e ficou parada.",
+      "Numa sessao de fundo NAO existe ninguem no terminal para escolher a opcao,",
+      "e a pergunta nem sai no Telegram: AskUserQuestion nao passa pelo canal,",
+      "entao o dono nunca viu que havia pergunta. Pior, tudo que ele mandou",
+      "depois ('oi', 18:32) ficou enfileirado atras do bloqueio.",
+      "",
+      "Estava no allow -- ou seja, liberado. Trava de PROMPT nao resolve (ela ja",
+      "tem instrucao de responder pelo Telegram e chamou assim mesmo), entao a",
+      "trava e de FERRAMENTA: negada. Sem ela, pergunta so pode sair por",
+      "mcp__plugin_telegram_telegram__reply, que e o canal que o dono le."
+    ]
   },
   "hooks": {
     "PreToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/reaper/.local/bin/unity-primeiro-resumo",
+            "timeout": 10,
+            "statusMessage": "checando se ela ja falou com voce"
+          }
+        ]
+      },
       {
         "matcher": "Bash",
         "hooks": [
@@ -175,6 +205,37 @@
             "command": "/home/reaper/.local/bin/unity-block-delete",
             "timeout": 15,
             "statusMessage": "checando exclusão e segredo"
+          }
+        ]
+      },
+      {
+        "matcher": "EnterWorktree",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/reaper/.local/bin/unity-barra-worktree",
+            "timeout": 15,
+            "statusMessage": "checando se o worktree ia pedir aprovacao"
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__plugin_telegram_telegram__reply",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/reaper/.local/bin/unity-guarda-idioma"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/reaper/.local/bin/unity-exige-resposta"
           }
         ]
       }
@@ -195,5 +256,43 @@
   ],
   "env": {
     "UNITY_NO_TELEGRAM_HOOK": "1"
-  }
+  },
+  "_comment_crossSessionInbound": [
+    "Portao de mensagem entre sessoes. O default retem esperando o usuario da",
+    "sessao DE DESTINO aprovar — e sessao de fundo nao tem usuario olhando, entao",
+    "a mensagem ficava retida ate expirar. Medido em 19/08/2026: duas mensagens",
+    "para a Unity voltaram como 'held for the recipient user's approval' e depois",
+    "'not approved before expiry', com o SendMessage do remetente devolvendo",
+    "success:true nos dois casos. E o mesmo modo de falha do ListAgents fora da",
+    "allow, uma camada adiante: prompt sem quem responda vira bloqueio silencioso.",
+    "'accept' entrega direto. Aceita accept | hold | refuse."
+  ],
+  "crossSessionInbound": "accept",
+  "_comment_enabledPlugins_vercel": [
+    "Vercel DESLIGADO explicitamente. Ele está ligado em ~/.claude/settings.json",
+    "e a Unity herdava — dezenas de ferramentas e skills que ela nunca usa.",
+    "Custo medido em 19/08/2026: com a superfície inchada, o `reply` do Telegram",
+    "cai no grupo de ferramentas ADIADAS, e ela precisa gastar um ToolSearch",
+    "(~6 s, uma ida e volta inteira) antes de conseguir falar. Turnos reais:",
+    "'Bom dia' com o reply já carregado = 4,0 s; 'oi' passando pelo ToolSearch",
+    "= 16,3 s. Listar false aqui é obrigatório: este bloco MESCLA com o global,",
+    "não o substitui — omitir a chave deixaria o true de lá valendo."
+  ],
+  "_comment_hooks_Stop": [
+    "Fica AQUI e nao no ~/.claude/settings.json de proposito: o hook global roda",
+    "em toda sessao da maquina, e uma sessao interativa do dono nao tem canal do",
+    "Telegram para responder. Aqui ele so vale para a Unity.",
+    "Impede o turno de fechar com mensagem do Telegram sem reply — o bug do",
+    "'so o emote' que ele reportou em 19/08/2026."
+  ],
+  "_comment_hooks_PreToolUse": [
+    "O hook do reply (idioma + rodape de custo) fica AQUI, nao no",
+    "~/.claude/settings.json. Medido em 21/08/2026: `--settings` SUBSTITUI os",
+    "hooks globais, nao mescla — a Unity roda com --settings, entao nada do",
+    "global chegava nela. Sintomas: nenhuma resposta saia com rodape, e a trava",
+    "de idioma (construida em 19/08) NUNCA esteve ativa nela. A prova do",
+    "contrario e o Stop hook, que sempre esteve neste arquivo e tem 38 turnos",
+    "bloqueados registrados.",
+    "Regra: hook que precisa valer para a Unity mora NESTE arquivo."
+  ]
 }

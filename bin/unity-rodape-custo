@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""Hook PreToolUse: cola o rodapé de consumo na resposta, sem custar um turno.
+
+História: o rodapé era obrigatório e ela o obtinha rodando `unity-uso --linha`.
+Comando = uma ida e volta inteira do modelo antes de conseguir falar — medido em
+19/08/2026, era a diferença entre responder "oi" em 4,0 s e em 16,3 s. Tornei o
+rodapé condicional para cortar isso, e o dono sentiu falta dos números.
+
+Este hook resolve os dois: o rodapé volta em TODA mensagem, e custa **zero** ida
+e volta — ele é montado aqui, fora do modelo, em ~100 ms de subprocesso.
+
+Ela não sabe que isto existe e não deve saber: quanto menos regra na persona,
+menos token por turno e menos coisa para ela esquecer.
+"""
+import json
+import subprocess
+import sys
+
+FERRAMENTA = "mcp__plugin_telegram_telegram__reply"
+# O plugin do Telegram já divide mensagem acima de 4096 preferindo quebra de
+# linha, então o rodapé cai no fim do último pedaço sozinho. Não trunco aqui de
+# propósito: cortar a resposta dela para caber um rodapé seria trocar conteúdo
+# por enfeite.
+MARCA = "📊 Claude"
+
+
+def liberar():
+    sys.exit(0)
+
+
+def rodape():
+    try:
+        r = subprocess.run(["/home/reaper/.local/bin/unity-uso", "--linha"],
+                           capture_output=True, text=True, timeout=8)
+        return r.stdout.strip() if r.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def main():
+    try:
+        evento = json.load(sys.stdin)
+    except Exception:
+        liberar()
+
+    if evento.get("tool_name") != FERRAMENTA:
+        liberar()
+
+    entrada = evento.get("tool_input") or {}
+    texto = entrada.get("text") or ""
+    if not texto.strip():
+        liberar()
+
+    # Ela mesma já colou o rodapé (pergunta de custo, por exemplo): não duplica.
+    if MARCA in texto:
+        liberar()
+
+    pe = rodape()
+    if not pe:
+        # Rodapé faltando é aceitável; número inventado não. Deixa passar limpo.
+        liberar()
+
+    nova = dict(entrada)
+    nova["text"] = texto.rstrip() + "\n\n" + pe
+
+    print(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "updatedInput": nova,
+        }
+    }))
+    sys.exit(0)
+
+
+main()

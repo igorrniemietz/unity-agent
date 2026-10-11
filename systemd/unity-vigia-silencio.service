@@ -1,0 +1,8 @@
+[Unit]
+Description=Unity — avisa se uma mensagem do Igor ficou sem resposta (qualquer causa)
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/reaper
+Environment=PATH=/home/reaper/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/reaper/.local/bin/unity-vigia-silencio

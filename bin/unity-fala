@@ -36,7 +36,7 @@ import tempfile
 from pathlib import Path
 
 VOZ = os.environ.get("UNITY_VOZ", "pt-BR-ThalitaMultilingualNeural")
-# Thalita é a voz que o Igor prefere ouvir (25/09 e 28/09/2026).
+# Thalita é a voz que o dono prefere ouvir (25/09 e 28/09/2026).
 #
 # Ela é Multilingual e escolhe a fonética POR FRASE, não por mensagem — daí o
 # defeito que ele reclamou em 28/09: numa mensagem de 190 caracteres, a
@@ -109,7 +109,7 @@ _SUBS = (
 _URL = re.compile(r"https?://\S+")
 _CAMINHO = re.compile(r"(?<![\w~])~?/(?:[\w.\-]+/)+[\w.\-]*")
 _SEPARADOR = re.compile(r"[·•|—–~`#*_>]+")
-# Nome composto por hífen ("unity-delegar", "lemitz-kanban") é lido como uma
+# Nome composto por hífen ("unity-delegar", "kanban-exemplo") é lido como uma
 # palavra estrangeira só e sai embolado — "unity-delegar" virou "Íunite
 # Delegar" no round-trip de 25/09/2026. Com espaço, cada metade é pronunciada
 # inteira. Só troca quando os dois lados têm duas letras ou mais, para não
@@ -119,7 +119,7 @@ _HIFEN_COMPOSTO = re.compile(r"(?<=[^\W\d_]{2})-(?=[^\W\d_]{2})")
 # Nome próprio estrangeiro escrito do jeito certo é lido pela voz pt-BR com a
 # fonética portuguesa da grafia: "Claude" vira "cláu-de", "cache" vira "cá-che".
 # Aqui ele é reescrito do jeito que se PRONUNCIA, e só na cópia falada — o que
-# o Igor lê na tela continua escrito certo. Cada linha foi conferida por
+# o dono lê na tela continua escrito certo. Cada linha foi conferida por
 # round-trip (TTS -> faster-whisper) em 28/09/2026: o whisper devolveu o nome
 # na grafia original, sinal de que o som saiu certo.
 _PRONUNCIA = tuple(
@@ -227,7 +227,7 @@ def escolher_voz(texto):
 
     Voz Multilingual decide a fonética lendo o texto, e em frase curta decide
     errado (ver LIMITE_CURTO). Voz monolíngue não tem esse problema, então a
-    troca só faz sentido para a primeira — inclusive quando o Igor pede a
+    troca só faz sentido para a primeira — inclusive quando o dono pede a
     Thalita de volta por UNITY_VOZ.
     """
     voz = os.environ.get("UNITY_VOZ") or VOZ

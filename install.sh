@@ -45,6 +45,11 @@ fi
 echo "→ settings da Unity"
 reescrever "$REPO/config/unity-settings.json" "$HOME/.claude/supervisor-settings.json"
 
+# Sem este, o executor despachado trava pedindo aprovação de Bash — e num
+# `claude -p` não existe ninguém para responder. Falhava calado antes de o
+# arquivo passar a ser copiado aqui.
+reescrever "$REPO/config/dispatch-settings.json" "$HOME/.claude/dispatch-settings.json"
+
 if [ ! -f "$HOME/.claude/channels/telegram/access.json" ]; then
   cp "$REPO/config/telegram-access.example.json" \
      "$HOME/.claude/channels/telegram/access.json"
@@ -67,12 +72,30 @@ fi
 
 systemctl --user daemon-reload
 systemctl --user enable --now unity-daemon.service
-systemctl --user enable --now unity-supervisor.timer unity-costs.timer \
-        unity-digest.timer unity-alerta-ai-memory.timer unity-pendencias.timer
+
+# Todo timer que existir no repo é armado. Antes a lista era escrita à mão aqui
+# e envelhecia calada: timer novo entrava no repo e nunca subia em quem
+# instalava. Falha por unit não aborta o resto — um vigia que não arma é um
+# recurso de menos, não uma instalação perdida.
+echo "→ armando timers"
+for t in "$REPO"/systemd/unity-*.timer; do
+  nome="$(basename "$t")"
+  if systemctl --user enable --now "$nome" 2>/dev/null; then
+    echo "  $nome"
+  else
+    echo "  AVISO: $nome não armou — veja systemctl --user status $nome"
+  fi
+done
 
 echo
-echo "Instalado. Falta:"
-echo "  1. token do bot em ~/.claude/channels/telegram/.env (TELEGRAM_BOT_TOKEN=...)"
-echo "  2. seu ID de usuário em ~/.claude/channels/telegram/access.json"
-echo "  3. descrever seus projetos em ~/.claude/orquestrador/projetos.md"
-echo "  4. systemctl --user start unity-supervisor.service"
+echo "Instalado. O que ainda falta, item por item:"
+echo
+"$BIN/unity-doctor" || true
+echo
+echo "O que só você sabe (o instalador não tem como adivinhar):"
+echo "  1. token do bot — ~/.claude/channels/telegram/ (TELEGRAM_BOT_TOKEN=...)"
+echo "  2. seu ID de usuário — ~/.claude/channels/telegram/access.json"
+echo "  3. seus projetos    — ~/.claude/orquestrador/projetos.md"
+echo
+echo "Não sabe por onde começar? Rode 'claude' nesta pasta e diga"
+echo "\"configura a Unity neste PC\" — o CLAUDE.md conduz o resto."

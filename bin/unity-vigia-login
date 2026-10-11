@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""Detecta sessão travada por login expirado e AVISA no Telegram.
+
+Em 21/08/2026 a Unity recebeu um pedido do dono as 09:38 e respondeu, tres
+vezes, apenas "Login expired · Please run /login" — texto que so aparece no
+terminal dela. Ele ficou 1h35 sem resposta nenhuma, achando que ela travou.
+
+Nada das travas existentes cobre isso: o hook Stop nao roda (a sessao nem chega
+a produzir turno), o heartbeat ve status=idle (ela nao esta "trabalhando") e o
+reply nunca e chamado porque o modelo nao responde. Um agente que nao consegue
+falar com o modelo nao consegue avisar que nao consegue falar com o modelo —
+por isso o aviso tem que sair por script, sem LLM.
+"""
+import json
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+PROJ = Path.home() / ".claude/projects/-home-reaper"
+ESTADO = Path.home() / ".local/share/unity-supervisor/login-expirado.json"
+SINAIS = ("Login expired", "Please run /login", "Invalid API key",
+          "Credit balance is too low", "OAuth token has expired")
+JANELA = 1800   # so olha o que aconteceu na ultima meia hora
+
+
+def lib():
+    import importlib.machinery, importlib.util
+    ld = importlib.machinery.SourceFileLoader(
+        "unity_lib", "/home/reaper/.local/bin/unity-lib.py")
+    sp = importlib.util.spec_from_loader("unity_lib", ld)
+    m = importlib.util.module_from_spec(sp); ld.exec_module(m)
+    return m
+
+
+def sessao_viva():
+    try:
+        d = json.loads(subprocess.run(["claude", "agents", "--json"],
+                       capture_output=True, text=True, timeout=25).stdout)
+    except Exception:
+        return None
+    for a in (d if isinstance(d, list) else d.get("agents", [])):
+        if a.get("id") and a.get("cwd") == str(Path.home()):
+            return a
+    return None
+
+
+def main():
+    a = sessao_viva()
+    if not a:
+        return 0
+    arq = PROJ / f"{a['sessionId']}.jsonl"
+    if not arq.is_file():
+        return 0
+
+    corte = time.strftime("%Y-%m-%dT%H:%M", time.gmtime(time.time() - JANELA))
+    achou = None
+    pedido_pendente = False
+    for linha in arq.read_text(errors="replace").splitlines():
+        try:
+            d = json.loads(linha)
+        except Exception:
+            continue
+        ts = d.get("timestamp") or ""
+        if ts[:16] < corte:
+            continue
+        m = d.get("message") or {}
+        c = m.get("content")
+        if d.get("type") == "user" and isinstance(c, str) and "<channel" in c:
+            pedido_pendente = True
+        elif d.get("type") == "assistant" and isinstance(c, list):
+            for b in c:
+                if isinstance(b, dict) and b.get("type") == "text":
+                    t = b.get("text", "")
+                    if any(s in t for s in SINAIS):
+                        achou = t.strip()[:120]
+
+    if not achou:
+        ESTADO.unlink(missing_ok=True)   # voltou ao normal: rearma
+        return 0
+
+    # Um aviso por episodio. Sem isto o timer repetiria a cada passada.
+    try:
+        if json.loads(ESTADO.read_text()).get("avisado"):
+            return 0
+    except Exception:
+        pass
+
+    linhas = ["🔴 Nao consigo responder",
+              "",
+              "Minha credencial expirou, entao",
+              "nao chego no modelo. Seus pedidos",
+              "estao na fila, nao perdidos."]
+    if pedido_pendente:
+        linhas.append("")
+        linhas.append("Tem pedido seu esperando.")
+    linhas += ["", "Rode /login numa sessao do", "Claude Code e me chame de novo."]
+    lib().send_telegram("\n".join(linhas), silent=False)
+
+    ESTADO.parent.mkdir(parents=True, exist_ok=True)
+    ESTADO.write_text(json.dumps({"avisado": time.time(), "erro": achou}))
+    return 0
+
+
+try:
+    raise SystemExit(main())
+except SystemExit:
+    raise
+except Exception:
+    raise SystemExit(0)

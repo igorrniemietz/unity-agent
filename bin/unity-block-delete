@@ -87,12 +87,12 @@ def usa_segredo(cmd):
     O discriminador é o token, não a string inteira. Um caminho de verdade vem
     como argumento próprio — sem espaço. Um caminho CITADO dentro de um prompt
     vem dentro de um token grande, cheio de espaços, que é dado para outro
-    programa (`unity-despachar "...«/home/reaper/infra/x/.env»..."`), não lido
+    programa (`unity-delegar "...«/home/reaper/infra/x/.env»..."`), não lido
     por este comando.
 
     Foi essa a confusão que travou a Unity em 2026-08-01: o teste antigo era
     `regex_do_segredo AND verbo_de_leitura` procurados em QUALQUER lugar da
-    linha, então um despacho que mencionava um caminho e a palavra "tail" no
+    linha, então uma delegação que mencionava um caminho e a palavra "tail" no
     meio da prosa era barrado como se estivesse lendo o arquivo.
     """
     for seg in _segmentos(cmd):

@@ -1,0 +1,317 @@
+#!/usr/bin/env python3
+"""Diz o que FALTA para a Unity funcionar neste PC, item por item.
+
+Existe porque a instalação não é um passo, são uns dez — e metade depende de
+coisa que o `install.sh` não tem como criar sozinho: um token que só o dono do
+bot tem, um ID de usuário do Telegram, um binário que precisa ser instalado
+antes. Sem um inventário honesto, quem instala descobre o que faltou pelo
+sintoma: canal mudo, resposta que não chega, delegação que morre em 5s.
+
+É também o arquivo que o LLM lê quando alguém pede "configura a Unity aqui".
+Por isso a saída tem duas caras:
+
+  unity-doctor           relatório para humano, agrupado por camada
+  unity-doctor --json    o mesmo em JSON, para o agente decidir o que fazer
+
+A classificação é de três níveis, e a diferença importa:
+
+  ok        existe e está no lugar certo
+  falta     o NÚCLEO não funciona sem isso — a Unity não sobe
+  opcional  a Unity sobe sem isso; só aquele recurso fica de fora
+
+Nada aqui lê segredo. O token e as chaves são verificados por EXISTÊNCIA e
+tamanho do arquivo, nunca pelo conteúdo: um doctor que imprime chave no
+terminal é um vazamento com cara de diagnóstico.
+"""
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+HOME = Path.home()
+BIN = HOME / ".local/bin"
+UNITS = HOME / ".config/systemd/user"
+PROMPTS = HOME / ".claude/orquestrador"
+CANAL = HOME / ".claude/channels/telegram"
+
+
+def tem_conteudo(p: Path, minimo: int = 10) -> bool:
+    """Arquivo existe E não está vazio. O `install.sh` cria placeholder a partir
+    dos exemplos; um placeholder de 0 byte passaria como 'configurado'."""
+    try:
+        return p.is_file() and p.stat().st_size >= minimo
+    except OSError:
+        return False
+
+
+def unit_ativa(nome: str) -> bool:
+    try:
+        r = subprocess.run(
+            ["systemctl", "--user", "is-active", nome],
+            capture_output=True, text=True, timeout=5,
+        )
+        return r.stdout.strip() == "active"
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def unit_habilitada(nome: str) -> bool:
+    try:
+        r = subprocess.run(
+            ["systemctl", "--user", "is-enabled", nome],
+            capture_output=True, text=True, timeout=5,
+        )
+        return r.stdout.strip() in ("enabled", "static")
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def porta_responde(porta: int) -> bool:
+    import socket
+    with socket.socket() as s:
+        s.settimeout(0.6)
+        return s.connect_ex(("127.0.0.1", porta)) == 0
+
+
+def no_wsl() -> bool:
+    try:
+        return "microsoft" in Path("/proc/version").read_text().lower()
+    except OSError:
+        return False
+
+
+# ── as checagens ──────────────────────────────────────────────────────────────
+# Cada uma devolve (estado, detalhe, comoResolver). `comoResolver` é escrito
+# para o LLM executar, não para o humano decorar: comando pronto quando dá, e
+# "pergunte ao dono" quando o dado só pode vir dele.
+
+def checagens():
+    c = []
+
+    # NÚCLEO — sem isso não existe Unity.
+    claude = shutil.which("claude")
+    c.append(("nucleo", "Claude Code (binário `claude`)",
+              "ok" if claude else "falta",
+              claude or "não está no PATH",
+              "instale o Claude Code e garanta que `claude` esteja no PATH"))
+
+    c.append(("nucleo", "Python 3.11+",
+              "ok" if sys.version_info >= (3, 11) else "falta",
+              ".".join(map(str, sys.version_info[:3])),
+              "instale python3 >= 3.11 (os scripts usam sintaxe nova)"))
+
+    bun = shutil.which("bun")
+    c.append(("nucleo", "bun (roda o servidor do canal do Telegram)",
+              "ok" if bun else "falta",
+              bun or "ausente",
+              "curl -fsSL https://bun.sh/install | bash"))
+
+    tem_systemd = Path("/run/systemd/system").exists()
+    c.append(("nucleo", "systemd em modo usuário",
+              "ok" if tem_systemd else "falta",
+              "disponível" if tem_systemd else "não encontrado",
+              "em host headless: loginctl enable-linger $USER"))
+
+    n_scripts = len(list(BIN.glob("unity-*"))) if BIN.is_dir() else 0
+    c.append(("nucleo", "scripts instalados em ~/.local/bin",
+              "ok" if n_scripts >= 20 else "falta",
+              f"{n_scripts} encontrados",
+              "rode ./install.sh na raiz do repo"))
+
+    c.append(("nucleo", "units do systemd instaladas",
+              "ok" if UNITS.is_dir() and list(UNITS.glob("unity-*")) else "falta",
+              f"{len(list(UNITS.glob('unity-*'))) if UNITS.is_dir() else 0} encontradas",
+              "rode ./install.sh na raiz do repo"))
+
+    c.append(("nucleo", "settings da Unity (~/.claude/supervisor-settings.json)",
+              "ok" if tem_conteudo(HOME / ".claude/supervisor-settings.json", 200) else "falta",
+              "presente" if tem_conteudo(HOME / ".claude/supervisor-settings.json", 200) else "ausente",
+              "rode ./install.sh — ele copia de config/unity-settings.json"))
+
+    c.append(("nucleo", "daemon de pé (unity-daemon.service)",
+              "ok" if unit_ativa("unity-daemon.service") else "falta",
+              "ativo" if unit_ativa("unity-daemon.service") else "parado",
+              "systemctl --user enable --now unity-daemon.service"))
+
+    c.append(("nucleo", "vigia armado (unity-supervisor.timer)",
+              "ok" if unit_habilitada("unity-supervisor.timer") else "falta",
+              "armado" if unit_habilitada("unity-supervisor.timer") else "desarmado",
+              "systemctl --user enable --now unity-supervisor.timer"))
+
+    # CANAL — a Unity sobe sem, mas ninguém fala com ela.
+    # Verificado por existência e tamanho. O conteúdo não é lido de propósito.
+    tok = CANAL / ".env"
+    c.append(("canal", "token do bot do Telegram",
+              "ok" if tem_conteudo(tok, 40) else "falta",
+              "configurado" if tem_conteudo(tok, 40) else f"ausente ou vazio ({tok})",
+              "crie um bot no @BotFather e grave "
+              "TELEGRAM_BOT_TOKEN=... no arquivo de ambiente do canal; "
+              "o token só o dono do bot tem — PERGUNTE a ele, não invente"))
+
+    acc = CANAL / "access.json"
+    acc_ok = False
+    if tem_conteudo(acc, 10):
+        try:
+            d = json.loads(acc.read_text())
+            # O exemplo vem com um ID placeholder; um access.json que ainda
+            # tem o placeholder não é um canal configurado, é um canal mudo.
+            bruto = json.dumps(d)
+            acc_ok = "SEU_ID" not in bruto and "123456789" not in bruto
+        except (OSError, ValueError):
+            acc_ok = False
+    c.append(("canal", "allowlist do canal (access.json)",
+              "ok" if acc_ok else "falta",
+              "com ID real" if acc_ok else "ausente ou ainda com o ID de exemplo",
+              "descubra o ID numérico do usuário no Telegram (@userinfobot) "
+              "e ponha em access.json — PERGUNTE ao dono, é dado dele"))
+
+    # PERSONA — ela sobe sem, mas sem saber quem é nem para onde mandar.
+    for arq, papel in (("persona.md", "como ela fala"),
+                       ("roteamento.md", "como ela decide"),
+                       ("projetos.md", "o índice de projetos do dono")):
+        p = PROMPTS / arq
+        estado = "ok" if tem_conteudo(p, 100) else "falta"
+        resolve = "rode ./install.sh"
+        if arq == "projetos.md":
+            resolve = ("copie prompts/projetos.example.md para "
+                       f"{p} e PERGUNTE ao dono quais projetos ele tem — "
+                       "esse índice é a lista de destinos dela, não dá para adivinhar")
+        c.append(("persona", f"{arq} ({papel})", estado,
+                  "presente" if estado == "ok" else "ausente", resolve))
+
+    # FAIXAS DE EXECUÇÃO — pelo menos UMA tem de existir, senão ela não delega.
+    oc = shutil.which("opencode") or (
+        str(HOME / ".opencode/bin/opencode")
+        if (HOME / ".opencode/bin/opencode").exists() else None)
+    c.append(("faixas", "opencode (faixa grátis padrão)",
+              "ok" if oc else "falta",
+              oc or "ausente",
+              "curl -fsSL https://opencode.ai/install | bash  "
+              "— depois `opencode auth login` para o provedor zen"))
+
+    chave_or = HOME / ".config/unity/openrouter.key"
+    tem_or = tem_conteudo(chave_or, 20) or bool(os.environ.get("OPENROUTER_API_KEY"))
+    c.append(("faixas", "OpenRouter (segunda faixa grátis, --nivel nex)",
+              "ok" if tem_or else "opcional",
+              "configurada" if tem_or else "sem chave",
+              "crie a chave em openrouter.ai e grave em "
+              f"{chave_or} — PERGUNTE ao dono, é credencial dele"))
+
+    disp = HOME / ".claude/dispatch-settings.json"
+    c.append(("faixas", "permissões do executor despachado",
+              "ok" if tem_conteudo(disp, 200) else "falta",
+              "presente" if tem_conteudo(disp, 200) else "ausente",
+              "cp config/dispatch-settings.json ~/.claude/ — sem ele o "
+              "executor trava pedindo aprovação de Bash e a tarefa morre pela metade"))
+
+    # OPCIONAIS — cada um liga UM recurso. A Unity funciona sem todos.
+    tts = shutil.which("edge-tts")
+    c.append(("voz", "edge-tts (a Unity responder falando)",
+              "ok" if tts else "opcional",
+              tts or "ausente",
+              "pip install edge-tts — depois teste com `unity-fala \"oi\"`. "
+              "Sem isso ela responde só por texto, e tudo o mais funciona"))
+
+    ffmpeg = shutil.which("ffmpeg")
+    c.append(("voz", "ffmpeg (converte o áudio para o formato do Telegram)",
+              "ok" if ffmpeg else "opcional",
+              ffmpeg or "ausente",
+              "apt install ffmpeg (ou equivalente). Só é preciso se a voz for ligada"))
+
+    whisper = shutil.which("whisper-ctranslate2") or shutil.which("whisper")
+    c.append(("voz", "whisper (ela ENTENDER nota de voz)",
+              "ok" if whisper else "opcional",
+              whisper or "ausente",
+              "pip install whisper-ctranslate2 — roda na GPU se houver. "
+              "Sem isso, nota de voz chega e não é transcrita"))
+
+    # Gerador de imagem: a Unity não embute nenhum. Ela usa o que estiver de pé.
+    comfy = porta_responde(8188)
+    c.append(("imagem", "ComfyUI respondendo em :8188 (gerar imagem local)",
+              "ok" if comfy else "opcional",
+              "respondendo" if comfy else "não encontrado",
+              "instale o ComfyUI e suba com a API na 8188. Sem isso a Unity "
+              "simplesmente não gera imagem — nenhum outro recurso é afetado"))
+
+    mem = porta_responde(49374)
+    c.append(("memoria", "ai-memory em :49374 (memória de longo prazo)",
+              "ok" if mem else "opcional",
+              "respondendo" if mem else "não encontrado",
+              "serviço separado, não faz parte deste repo. Sem ele a Unity "
+              "lembra só do que está nos prompts e no ~/.claude/projects"))
+
+    router = porta_responde(8787)
+    c.append(("memoria", "roteador de LLM local (rodapé de consumo)",
+              "ok" if router else "opcional",
+              "respondendo" if router else "não encontrado",
+              "serviço separado. Sem ele o rodapé de custo fica incompleto; "
+              "o resto não muda"))
+
+    # WSL — a pegadinha que deixa tudo 'enabled' e nada rodando.
+    if no_wsl():
+        startup = list(Path("/mnt/c/Users").glob(
+            "*/AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Startup/unity-autostart.vbs"))
+        c.append(("wsl", "lançador no Startup do Windows",
+                  "ok" if startup else "falta",
+                  str(startup[0]) if startup else "ausente",
+                  "copie windows/unity-autostart.vbs para a pasta Startup do "
+                  "usuário do Windows. No WSL o `enable-linger` NÃO sobe a "
+                  "distro no logon — sem esse arquivo a Unity só acorda quando "
+                  "alguém abre um terminal"))
+
+    return c
+
+
+CAMADAS = {
+    "nucleo": "NÚCLEO — sem isso ela não sobe",
+    "canal": "CANAL — sem isso ninguém fala com ela",
+    "persona": "PERSONA — quem ela é e para onde ela manda",
+    "faixas": "EXECUÇÃO — quem faz o trabalho longo",
+    "voz": "VOZ (opcional)",
+    "imagem": "IMAGEM (opcional)",
+    "memoria": "SERVIÇOS EXTERNOS (opcionais)",
+    "wsl": "WSL — só se o host for Windows",
+}
+ICONE = {"ok": "ok  ", "falta": "FALTA", "opcional": "opc "}
+
+
+def main():
+    itens = checagens()
+
+    if "--json" in sys.argv:
+        print(json.dumps({
+            "pronta": not any(e == "falta" for _, _, e, _, _ in itens),
+            "itens": [
+                {"camada": cam, "item": item, "estado": est,
+                 "detalhe": det, "resolve": res}
+                for cam, item, est, det, res in itens
+            ],
+        }, ensure_ascii=False, indent=2))
+        return 0
+
+    faltando = [i for i in itens if i[2] == "falta"]
+
+    for cam, titulo in CAMADAS.items():
+        do_grupo = [i for i in itens if i[0] == cam]
+        if not do_grupo:
+            continue
+        print(f"\n{titulo}")
+        for _, item, est, det, res in do_grupo:
+            print(f"  [{ICONE[est]}] {item} — {det}")
+            if est != "ok":
+                print(f"           → {res}")
+
+    print()
+    if faltando:
+        print(f"{len(faltando)} item(ns) do núcleo faltando. "
+              "A Unity não vai atender até resolver.")
+        return 1
+    print("Núcleo completo. O que estiver marcado 'opc' é recurso extra, "
+          "não impedimento.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
